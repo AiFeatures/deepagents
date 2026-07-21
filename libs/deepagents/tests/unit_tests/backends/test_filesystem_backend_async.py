@@ -1,13 +1,16 @@
 """Async tests for FilesystemBackend."""
 
+import time
 from pathlib import Path
 
 import pytest
 from langchain.tools import ToolRuntime
 from langchain_core.messages import ToolMessage
 
+from deepagents.backends import filesystem as fs_module
 from deepagents.backends.filesystem import FilesystemBackend
-from deepagents.backends.protocol import EditResult, WriteResult
+from deepagents.backends.protocol import EditResult, ReadResult, WriteResult
+from deepagents.backends.utils import format_grep_matches
 from deepagents.middleware.filesystem import FilesystemMiddleware
 
 
@@ -31,7 +34,7 @@ async def test_filesystem_backend_async_normal_mode(tmp_path: Path):
     paths = {i["path"] for i in infos}
     assert str(f1) in paths  # File in root should be listed
     assert str(f2) not in paths  # File in subdirectory should NOT be listed
-    assert (str(root) + "/dir/") in paths  # Directory should be listed
+    assert (str(root / "dir") + "/") in paths  # Directory should be listed
 
     # aread, aedit, awrite
     txt = await be.aread(str(f1))
@@ -133,8 +136,9 @@ async def test_filesystem_backend_als_nested_directories(tmp_path: Path):
     assert "/src/utils/common.py" in utils_paths
     assert len(utils_paths) == 2
 
-    empty_listing = await be.als_info("/nonexistent/")
-    assert empty_listing == []
+    empty_listing = await be.als("/nonexistent/")
+    assert empty_listing.entries is None
+    assert empty_listing.error == "Path '/nonexistent/': path_not_found"
 
 
 async def test_filesystem_backend_als_normal_mode_nested(tmp_path: Path):
@@ -192,8 +196,9 @@ async def test_filesystem_backend_als_trailing_slash(tmp_path: Path):
     assert len(listing1) == len(listing2)
     assert [fi["path"] for fi in listing1] == [fi["path"] for fi in listing2]
 
-    empty = await be.als_info("/nonexistent/")
-    assert empty == []
+    empty = await be.als("/nonexistent/")
+    assert empty.entries is None
+    assert empty.error == "Path '/nonexistent/': path_not_found"
 
 
 async def test_filesystem_backend_intercept_large_tool_result_async(tmp_path: Path):
@@ -493,6 +498,37 @@ async def test_filesystem_agrep_with_glob(tmp_path: Path):
     assert not any("test.txt" in p for p in py_files)
 
 
+async def test_filesystem_agrep_with_context(tmp_path: Path):
+    target = tmp_path / "sample.txt"
+    target.write_text("before\nneedle\nafter\n")
+    backend = FilesystemBackend(root_dir=tmp_path, virtual_mode=True)
+
+    result = await backend.agrep("needle", path="/", context_lines=1)
+
+    assert result.matches is not None
+    assert format_grep_matches(result.matches, "content") == "/sample.txt:\n  1- before\n  2: needle\n  3- after"
+    with pytest.raises(ValueError, match="context_lines must be non-negative"):
+        await backend.agrep("needle", path="/", context_lines=-1)
+
+
+async def test_filesystem_agrep_with_context_times_out(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
+    target = tmp_path / "sample.txt"
+    target.write_text("before\nneedle\nafter\n")
+    backend = FilesystemBackend(root_dir=tmp_path, virtual_mode=True)
+
+    def slow_grep(*_args: object, **_kwargs: object) -> None:
+        time.sleep(0.5)
+
+    monkeypatch.setattr(fs_module, "ASYNC_GREP_TIMEOUT", 0.01)
+    monkeypatch.setattr(backend, "grep", slow_grep)
+
+    result = await backend.agrep("needle", path="/", context_lines=1)
+
+    assert result.matches is None
+    assert result.error is not None
+    assert "timed out" in result.error
+
+
 async def test_filesystem_aglob_recursive(tmp_path: Path):
     """Test async glob with recursive patterns."""
     root = tmp_path
@@ -516,3 +552,35 @@ async def test_filesystem_aglob_recursive(tmp_path: Path):
     assert any("helper.py" in p for p in py_files)
     assert any("test_main.py" in p for p in py_files)
     assert not any("readme.txt" in p for p in py_files)
+
+
+async def test_als_nonexistent_path_sets_error(tmp_path: Path) -> None:
+    """Async ls on a missing path must surface the failure on .error, not return []."""
+    be = FilesystemBackend(root_dir=str(tmp_path), virtual_mode=True)
+
+    result = await be.als("/missing/")
+
+    assert result.entries is None
+    assert result.error == "Path '/missing/': path_not_found"
+
+
+async def test_als_file_path_sets_not_a_directory_error(tmp_path: Path) -> None:
+    """Async ls on a file path must surface not_a_directory on .error."""
+    write_file(tmp_path / "file.txt", "content")
+    be = FilesystemBackend(root_dir=str(tmp_path), virtual_mode=True)
+
+    result = await be.als("/file.txt")
+
+    assert result.entries is None
+    assert result.error == "Path '/file.txt': not_a_directory"
+
+
+async def test_als_empty_directory_returns_empty_entries(tmp_path: Path) -> None:
+    """Async ls on an empty directory returns success with an empty entries list."""
+    (tmp_path / "empty").mkdir()
+    be = FilesystemBackend(root_dir=str(tmp_path), virtual_mode=True)
+
+    result = await be.als("/empty/")
+
+    assert result.error is None
+    assert result.entries == []

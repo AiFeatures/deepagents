@@ -25,7 +25,7 @@ body:
   - type: checkboxes
     id: checks
     attributes:
-      label: Checked other resources
+      label: Submission checklist
       description: Please confirm the following.
       options:
         - label: This is a feature request, not a bug report.
@@ -43,7 +43,18 @@ body:
       description: Which area of the repository does this request relate to? Select at least one.
       options:
         - label: deepagents (SDK)
-        - label: cli
+        - label: dcode
+        - label: talon
+        - label: acp
+        - label: evals
+        - label: harbor
+        - label: daytona
+        - label: modal
+        - label: quickjs
+        - label: runloop
+        - label: vercel
+        - label: langsmith-sandbox
+        - label: Other / not sure / general
   - type: textarea
     id: feature-description
     validations:

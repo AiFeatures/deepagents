@@ -20,14 +20,29 @@ Linting exceptions:
 
 import os
 import re
+import stat
 import subprocess
 from collections.abc import Iterator
 from pathlib import Path
 
 import pytest
+from langchain.tools import ToolRuntime
 
-from deepagents.backends.protocol import EditResult, ExecuteResponse, FileInfo, GrepMatch, WriteResult
-from deepagents.backends.sandbox import BaseSandbox
+from deepagents.backends import CompositeBackend
+from deepagents.backends.filesystem import _map_exception_to_standard_error
+from deepagents.backends.protocol import (
+    EditResult,
+    ExecuteResponse,
+    FileDownloadResponse,
+    FileUploadResponse,
+    GlobResult,
+    GrepResult,
+    LsResult,
+    ReadResult,
+    WriteResult,
+)
+from deepagents.backends.sandbox import _EDIT_INLINE_MAX_BYTES, BaseSandbox
+from deepagents.middleware.filesystem import FilesystemMiddleware
 
 # Skip all tests in this module unless RUN_SANDBOX_TESTS=true
 pytestmark = pytest.mark.skipif(
@@ -46,6 +61,8 @@ class LocalSubprocessSandbox(BaseSandbox):
         self._id = "local-subprocess-sandbox"
         self._virtual_root = VIRTUAL_SANDBOX_ROOT
         self._real_root = self._virtual_root
+        # Real host shell, so capture-at-source (opt-in, default off) is supported.
+        self.enable_capture_offload = True
 
     def set_real_root(self, real_root: str) -> None:
         """Set the on-disk directory used for test file operations."""
@@ -55,7 +72,9 @@ class LocalSubprocessSandbox(BaseSandbox):
         """Map virtual sandbox paths in commands to a real test directory."""
         if self._real_root == self._virtual_root:
             return command
-        return re.sub(r"/tmp/+test_sandbox_ops", self._real_root, command)
+        # Use a lambda replacement so that Windows paths (containing `\`) in
+        # `self._real_root` are not interpreted as regex backreferences.
+        return re.sub(r"/tmp/+test_sandbox_ops", lambda _: self._real_root, command)
 
     def _translate_output_paths(self, output: str) -> str:
         """Map real test directory paths back to the virtual sandbox path."""
@@ -67,7 +86,8 @@ class LocalSubprocessSandbox(BaseSandbox):
         """Translate a virtual test path to its real on-disk location."""
         if self._real_root == self._virtual_root:
             return path
-        return re.sub(r"/tmp/+test_sandbox_ops", self._real_root, path)
+        # See `_translate_command_paths` for why a lambda is used.
+        return re.sub(r"/tmp/+test_sandbox_ops", lambda _: self._real_root, path)
 
     def _to_virtual_path(self, value: str) -> str:
         """Translate a real on-disk path back to the virtual test path."""
@@ -122,10 +142,13 @@ class LocalSubprocessSandbox(BaseSandbox):
 
     def ls_info(self, path: str) -> list[FileInfo]:
         """List files while preserving virtual-path expectations in tests."""
-        results = super().ls_info(self._to_real_path(path))
-        for entry in results:
-            entry["path"] = self._to_virtual_path(entry["path"])
-        return results
+        result = super().ls(self._to_real_path(path))
+        if result.entries is not None:
+            for entry in result.entries:
+                entry["path"] = self._to_virtual_path(entry["path"])
+        if result.error is not None:
+            result.error = self._to_virtual_path(result.error)
+        return result
 
     def read(self, file_path: str, offset: int = 0, limit: int = 2000) -> str:
         """Read file content from the mapped real path."""
@@ -171,9 +194,16 @@ class LocalSubprocessSandbox(BaseSandbox):
             match["path"] = self._to_virtual_path(match["path"])
         return result
 
-    def glob_info(self, pattern: str, path: str = "/") -> list[FileInfo]:
+    def glob(self, pattern: str, path: str | None = None) -> GlobResult:
         """Run glob against mapped real paths."""
-        return super().glob_info(pattern, path=self._to_real_path(path))
+        mapped_path = self._to_real_path(path) if path is not None else None
+        result = super().glob(pattern, path=mapped_path)
+        if result.error is not None:
+            result.error = self._to_virtual_path(result.error)
+        if result.matches is not None:
+            for match in result.matches:
+                match["path"] = self._to_virtual_path(match["path"])
+        return result
 
     @property
     def id(self) -> str:
@@ -251,20 +281,19 @@ class TestLocalSandboxOperations:
         exec_result = sandbox.execute(f"cat {test_path}")
         assert exec_result.output.strip() == content
 
-    def test_write_existing_file_fails(self, sandbox: LocalSubprocessSandbox) -> None:
-        """Test that writing to an existing file returns an error."""
+    def test_write_existing_file_overwrites(self, sandbox: LocalSubprocessSandbox) -> None:
+        """Test that writing to an existing file overwrites it."""
         test_path = "/tmp/test_sandbox_ops/existing.txt"
         # Create file first
         sandbox.write(test_path, "First content")
 
-        # Try to write again
+        # Write again should overwrite
         result = sandbox.write(test_path, "Second content")
 
-        assert result.error is not None
-        assert "already exists" in result.error.lower()
-        # Verify original content unchanged
+        assert result.error is None
+        # Verify new content
         exec_result = sandbox.execute(f"cat {test_path}")
-        assert exec_result.output.strip() == "First content"
+        assert exec_result.output.strip() == "Second content"
 
     def test_write_special_characters(self, sandbox: LocalSubprocessSandbox) -> None:
         """Test writing content with special characters and escape sequences."""
@@ -375,6 +404,30 @@ class TestLocalSandboxOperations:
 
         assert "Error:" in result
         assert "not found" in result.lower()
+
+    def test_read_permission_denied(self, sandbox: LocalSubprocessSandbox) -> None:
+        """Read on a chmod 000 file must surface permission_denied, not crash."""
+        test_path = "/tmp/test_sandbox_ops/locked_read.txt"
+        sandbox.write(test_path, "secret")
+        sandbox.execute(f"chmod 000 {test_path}")
+        try:
+            result = sandbox.read(test_path)
+            assert result.file_data is None
+            assert result.error is not None
+            assert "permission_denied" in result.error
+        finally:
+            sandbox.execute(f"chmod {stat.S_IRUSR | stat.S_IWUSR:o} {test_path}")
+
+    def test_read_directory_path(self, sandbox: LocalSubprocessSandbox) -> None:
+        """Read on a directory must surface not_a_file, not crash."""
+        base_dir = "/tmp/test_sandbox_ops/read_dir_target"
+        sandbox.execute(f"mkdir -p {base_dir}")
+
+        result = sandbox.read(base_dir)
+
+        assert result.file_data is None
+        assert result.error is not None
+        assert "not_a_file" in result.error
 
     def test_read_empty_file(self, sandbox: LocalSubprocessSandbox) -> None:
         """Test reading an empty file."""
@@ -580,6 +633,18 @@ class TestLocalSandboxOperations:
         assert result.error is not None
         assert "not_found" in result.error.lower() or "not found" in result.error.lower()
 
+    def test_edit_permission_denied(self, sandbox: LocalSubprocessSandbox) -> None:
+        """Edit on a chmod 000 file must surface permission_denied, not crash."""
+        test_path = "/tmp/test_sandbox_ops/locked_edit.txt"
+        sandbox.write(test_path, "Hello world")
+        sandbox.execute(f"chmod 000 {test_path}")
+        try:
+            result = sandbox.edit(test_path, "Hello", "Goodbye")
+            assert result.error is not None
+            assert "permission" in result.error.lower()
+        finally:
+            sandbox.execute(f"chmod {stat.S_IRUSR | stat.S_IWUSR:o} {test_path}")
+
     def test_edit_special_characters(self, sandbox: LocalSubprocessSandbox) -> None:
         """Test editing with special characters and regex metacharacters."""
         test_path = "/tmp/test_sandbox_ops/edit_special.txt"
@@ -716,6 +781,195 @@ class TestLocalSandboxOperations:
         assert "red cat" in file_content
         assert "The quick red cat jumps" in file_content
 
+    # ==================== CRLF handling (issue #2880) ====================
+
+    @staticmethod
+    def _place_raw(sandbox: "LocalSubprocessSandbox", virtual_path: str, raw: bytes) -> None:
+        """Write raw bytes to the real path behind a virtual sandbox path.
+
+        Bypasses `write()` so tests can seed files with CRLF byte sequences
+        exactly as they would exist on disk (e.g. templates edited on
+        Windows or shipped via npm without `.gitattributes`).
+        """
+        real = Path(sandbox._to_real_path(virtual_path))
+        real.parent.mkdir(parents=True, exist_ok=True)
+        real.write_bytes(raw)
+
+    @staticmethod
+    def _read_raw(sandbox: "LocalSubprocessSandbox", virtual_path: str) -> bytes:
+        """Read raw bytes from the real path behind a virtual sandbox path."""
+        return Path(sandbox._to_real_path(virtual_path)).read_bytes()
+
+    def test_edit_crlf_file_lf_old_string_inline(self, sandbox: LocalSubprocessSandbox) -> None:
+        """CRLF file + LF `old_string` (as the LLM sees it via read_file) should match.
+
+        `read()` normalizes CRLF to LF for the LLM, so `old_string` arrives
+        LF-only. The edit template reads raw bytes, so without CRLF-aware
+        matching the replacement deterministically fails.
+        """
+        path = "/tmp/test_sandbox_ops/crlf_inline.txt"
+        self._place_raw(sandbox, path, b"line1\r\nline2\r\nline3\r\n")
+
+        result = sandbox.edit(path, "line1\nline2", "REPLACED")
+
+        assert result.error is None
+        assert result.occurrences == 1
+        assert self._read_raw(sandbox, path) == b"REPLACED\r\nline3\r\n"
+
+    def test_edit_crlf_file_preserves_line_endings_on_new_string(self, sandbox: LocalSubprocessSandbox) -> None:
+        """`new_string` LF content should be written as CRLF on a CRLF file."""
+        path = "/tmp/test_sandbox_ops/crlf_new_string.txt"
+        self._place_raw(sandbox, path, b"a\r\nb\r\nc\r\n")
+
+        result = sandbox.edit(path, "a\nb", "x\ny\nz")
+
+        assert result.error is None
+        assert result.occurrences == 1
+        assert self._read_raw(sandbox, path) == b"x\r\ny\r\nz\r\nc\r\n"
+
+    def test_edit_lf_file_remains_lf(self, sandbox: LocalSubprocessSandbox) -> None:
+        """Pure-LF file with LF `old_string` should still work and stay LF."""
+        path = "/tmp/test_sandbox_ops/lf_regression.txt"
+        self._place_raw(sandbox, path, b"alpha\nbeta\ngamma\n")
+
+        result = sandbox.edit(path, "alpha\nbeta", "one\ntwo")
+
+        assert result.error is None
+        assert result.occurrences == 1
+        assert self._read_raw(sandbox, path) == b"one\ntwo\ngamma\n"
+
+    def test_edit_mixed_endings_lf_section(self, sandbox: LocalSubprocessSandbox) -> None:
+        """File with mixed endings: edits in an LF section stay LF."""
+        path = "/tmp/test_sandbox_ops/mixed_lf_section.txt"
+        self._place_raw(sandbox, path, b"lf1\nlf2\nlf3\ncrlf1\r\ncrlf2\r\n")
+
+        result = sandbox.edit(path, "lf1\nlf2", "LF_REPLACED")
+
+        assert result.error is None
+        assert result.occurrences == 1
+        assert self._read_raw(sandbox, path) == b"LF_REPLACED\nlf3\ncrlf1\r\ncrlf2\r\n"
+
+    def test_edit_mixed_endings_crlf_section(self, sandbox: LocalSubprocessSandbox) -> None:
+        """File with mixed endings: edits in a CRLF section stay CRLF."""
+        path = "/tmp/test_sandbox_ops/mixed_crlf_section.txt"
+        self._place_raw(sandbox, path, b"lf1\nlf2\ncrlf1\r\ncrlf2\r\ncrlf3\r\n")
+
+        result = sandbox.edit(path, "crlf1\ncrlf2", "CRLF_REPLACED")
+
+        assert result.error is None
+        assert result.occurrences == 1
+        assert self._read_raw(sandbox, path) == b"lf1\nlf2\nCRLF_REPLACED\r\ncrlf3\r\n"
+
+    def test_edit_crlf_genuine_string_not_found_still_surfaces(self, sandbox: LocalSubprocessSandbox) -> None:
+        """If no CRLF/LF variant matches, `string_not_found` must still surface."""
+        path = "/tmp/test_sandbox_ops/crlf_missing.txt"
+        self._place_raw(sandbox, path, b"alpha\r\nbeta\r\n")
+
+        result = sandbox.edit(path, "definitely not present", "x")
+
+        assert result.error is not None
+        assert "not found" in result.error.lower()
+        assert self._read_raw(sandbox, path) == b"alpha\r\nbeta\r\n"
+
+    def test_edit_crlf_replace_all(self, sandbox: LocalSubprocessSandbox) -> None:
+        """`replace_all=True` on a CRLF file should match and count every occurrence."""
+        path = "/tmp/test_sandbox_ops/crlf_replace_all.txt"
+        self._place_raw(sandbox, path, b"foo\r\nbar\r\nfoo\r\nbaz\r\n")
+
+        result = sandbox.edit(path, "foo", "X", replace_all=True)
+
+        assert result.error is None
+        assert result.occurrences == 2
+        assert self._read_raw(sandbox, path) == b"X\r\nbar\r\nX\r\nbaz\r\n"
+
+    def test_edit_crlf_roundtrip_after_read(self, sandbox: LocalSubprocessSandbox) -> None:
+        """End-to-end: read normalizes CRLF→LF, LLM uses that for old_string, edit preserves CRLF."""
+        path = "/tmp/test_sandbox_ops/crlf_roundtrip.txt"
+        self._place_raw(sandbox, path, b"## Summary\r\n\r\nHuman: hi\r\nAI: hello\r\n")
+
+        read_result = sandbox.read(path)
+        assert read_result.error is None
+        llm_view = read_result.file_data["content"]
+        # `read()` only shows LF to the LLM (sandbox.py:259 `newline=None`).
+        assert "\r" not in llm_view
+
+        result = sandbox.edit(path, "Human: hi\nAI: hello", "Human: bye\nAI: see you")
+
+        assert result.error is None
+        assert result.occurrences == 1
+        # On-disk bytes must still be CRLF — style preserved.
+        raw = self._read_raw(sandbox, path)
+        assert b"\r\n" in raw
+        assert b"Human: bye\r\nAI: see you\r\n" in raw
+
+    def test_edit_crlf_file_lf_old_string_upload_path(self, sandbox: LocalSubprocessSandbox) -> None:
+        """Same asymmetry exists in `_EDIT_TMPFILE_TEMPLATE` for large payloads."""
+        path = "/tmp/test_sandbox_ops/crlf_upload.txt"
+        # Build old/new strings larger than the inline threshold so the upload
+        # path is exercised; embed a CRLF-containing marker for the LLM's LF view.
+        marker_lf = "a\nb\nc"
+        filler = "x" * (_EDIT_INLINE_MAX_BYTES + 100)
+        old_lf = f"{marker_lf}\n{filler}"
+        new_lf = f"REPLACED\n{filler}"
+
+        marker_crlf = marker_lf.replace("\n", "\r\n")
+        file_bytes = f"prefix\r\n{marker_crlf}\r\n{filler}\r\nsuffix\r\n".encode()
+        self._place_raw(sandbox, path, file_bytes)
+
+        result = sandbox.edit(path, old_lf, new_lf)
+
+        assert result.error is None
+        assert result.occurrences == 1
+        raw = self._read_raw(sandbox, path)
+        # The filler block is CRLF-ending in the file — the written new_string
+        # should match that style.
+        assert b"REPLACED\r\n" in raw
+        assert raw.startswith(b"prefix\r\n")
+
+    def test_edit_crlf_multiple_occurrences_without_replace_all(self, sandbox: LocalSubprocessSandbox) -> None:
+        """`multiple_occurrences` still surfaces when the matched CRLF variant hits >1."""
+        path = "/tmp/test_sandbox_ops/crlf_multi.txt"
+        self._place_raw(sandbox, path, b"foo\r\nbar\r\nfoo\r\nbaz\r\n")
+
+        result = sandbox.edit(path, "foo\n", "X\n")
+
+        assert result.error is not None
+        assert "multiple times" in result.error.lower()
+        # File untouched.
+        assert self._read_raw(sandbox, path) == b"foo\r\nbar\r\nfoo\r\nbaz\r\n"
+
+    def test_edit_mixed_endings_replace_all_is_non_atomic(self, sandbox: LocalSubprocessSandbox) -> None:
+        """Pins current contract: `replace_all` only replaces in the first matching style.
+
+        On a mixed-ending file, the match-driven loop picks the first variant
+        with count >= 1 and breaks. `replace_all` then only touches occurrences
+        in that style. A second `edit()` call converges on the remaining
+        occurrences in the other style. This test pins that behavior so any
+        future change to make `replace_all` cross-style is deliberate.
+        """
+        path = "/tmp/test_sandbox_ops/mixed_replace_all.txt"
+        self._place_raw(sandbox, path, b"foo\nbar\nfoo\r\nbaz\r\n")
+
+        first = sandbox.edit(path, "foo", "X", replace_all=True)
+        assert first.error is None
+        # "foo" has no newlines; the as-is variant matches both occurrences.
+        assert first.occurrences == 2
+        assert self._read_raw(sandbox, path) == b"X\nbar\nX\r\nbaz\r\n"
+
+        # A newline-spanning old_string *does* split across styles.
+        self._place_raw(sandbox, path, b"hit\nnext\nhit\r\nnext\r\n")
+        second = sandbox.edit(path, "hit\nnext", "Y", replace_all=True)
+        assert second.error is None
+        # Only the LF-style occurrence is replaced on this call.
+        assert second.occurrences == 1
+        assert self._read_raw(sandbox, path) == b"Y\nhit\r\nnext\r\n"
+
+        # A follow-up edit catches the CRLF-style occurrence.
+        third = sandbox.edit(path, "hit\nnext", "Y", replace_all=True)
+        assert third.error is None
+        assert third.occurrences == 1
+        assert self._read_raw(sandbox, path) == b"Y\nY\r\n"
+
     # ==================== ls_info() tests ====================
 
     def test_ls_info_path_is_absolute(self, sandbox: LocalSubprocessSandbox) -> None:
@@ -759,12 +1013,24 @@ class TestLocalSandboxOperations:
         assert result == []
 
     def test_ls_info_nonexistent_directory(self, sandbox: LocalSubprocessSandbox) -> None:
-        """Test listing a directory that doesn't exist."""
+        """Ls on a missing path must surface the failure on .error, not return []."""
         nonexistent_dir = "/tmp/test_sandbox_ops/does_not_exist"
 
         result = sandbox.ls_info(nonexistent_dir)
 
-        assert result == []
+        assert result.entries is None
+        assert result.error == f"Path '{nonexistent_dir}': path_not_found"
+
+    def test_ls_info_permission_denied(self, sandbox: LocalSubprocessSandbox) -> None:
+        """Ls on an unreadable directory must surface the failure on .error."""
+        base_dir = "/tmp/test_sandbox_ops/ls_locked"
+        sandbox.execute(f"mkdir -p {base_dir} && chmod 000 {base_dir}")
+        try:
+            result = sandbox.ls(base_dir)
+            assert result.entries is None
+            assert result.error == f"Path '{base_dir}': permission_denied"
+        finally:
+            sandbox.execute(f"chmod {stat.S_IRWXU:o} {base_dir}")
 
     def test_ls_info_hidden_files(self, sandbox: LocalSubprocessSandbox) -> None:
         """Test that ls_info includes hidden files (starting with .)."""
@@ -848,10 +1114,17 @@ class TestLocalSandboxOperations:
         assert f"{base_dir}/file-3.txt" in paths
 
     def test_ls_info_path_is_sanitized(self, sandbox: LocalSubprocessSandbox) -> None:
-        """Test that ls_info base64-encodes paths to prevent injection."""
+        """Test that ls base64-encodes paths to prevent injection.
+
+        The malicious path is treated as a literal (non-existent) path on the
+        sandbox side, which must surface as a structured error rather than
+        executing any injected code.
+        """
         malicious_path = "'; import os; os.system('echo INJECTED'); #"
-        result = sandbox.ls_info(malicious_path)
-        assert result == []
+        result = sandbox.ls(malicious_path)
+        assert result.entries is None
+        assert result.error is not None
+        assert "path_not_found" in result.error
 
     def test_read_path_is_sanitized(self, sandbox: LocalSubprocessSandbox) -> None:
         """Test that read does not execute injected code in the path.
@@ -1191,6 +1464,28 @@ class TestLocalSandboxOperations:
         # Should work with explicit path
         assert isinstance(result, list)
 
+    def test_glob_path_not_found(self, sandbox: LocalSubprocessSandbox) -> None:
+        """Glob on a missing search path must surface path_not_found, not crash."""
+        missing = "/tmp/test_sandbox_ops/glob_missing_root"
+
+        result = sandbox.glob("*.py", path=missing)
+
+        assert result.matches is None
+        assert result.error is not None
+        assert "path_not_found" in result.error
+
+    def test_glob_permission_denied(self, sandbox: LocalSubprocessSandbox) -> None:
+        """Glob on an unreadable search path must surface permission_denied."""
+        locked_dir = "/tmp/test_sandbox_ops/glob_locked"
+        sandbox.execute(f"mkdir -p {locked_dir} && chmod 000 {locked_dir}")
+        try:
+            result = sandbox.glob("*.py", path=locked_dir)
+            assert result.matches is None
+            assert result.error is not None
+            assert "permission_denied" in result.error
+        finally:
+            sandbox.execute(f"chmod {stat.S_IRWXU:o} {locked_dir}")
+
     # ==================== Integration tests ====================
 
     def test_write_read_edit_workflow(self, sandbox: LocalSubprocessSandbox) -> None:
@@ -1238,3 +1533,126 @@ class TestLocalSandboxOperations:
         # Grep for a pattern
         grep_result = sandbox.grep_raw("file", path=base_dir)
         assert len(grep_result) >= 3  # At least 3 matches
+
+
+# 5000 of these lines (~250 KB) clear the default eviction budget (~80 KB).
+_BIG_OUTPUT_CMD = 'for i in $(seq 1 5000); do echo "line $i: padding text to make the output long enough to offload"; done'
+
+
+class TestExecuteCaptureOffload:
+    """End-to-end capture-at-source offload via the execute tool on a real shell.
+
+    Drives the `execute` and `read_file` tools through a `CompositeBackend` whose
+    default is a `LocalSubprocessSandbox` and whose `artifacts_root` lives under
+    the translated virtual root, so the wrapper's capture file lands in the test
+    directory rather than the host filesystem root.
+    """
+
+    @pytest.fixture(scope="class")
+    def sandbox(self) -> Iterator[LocalSubprocessSandbox]:
+        return LocalSubprocessSandbox()
+
+    @pytest.fixture(autouse=True)
+    def setup_test_dir(self, sandbox: LocalSubprocessSandbox, tmp_path: Path) -> None:
+        sandbox.set_real_root(str(tmp_path / "sandbox_ops"))
+        sandbox.execute("rm -rf /tmp/test_sandbox_ops && mkdir -p /tmp/test_sandbox_ops")
+
+    @pytest.fixture
+    def tools(self, sandbox: LocalSubprocessSandbox) -> tuple:
+        backend = CompositeBackend(default=sandbox, routes={}, artifacts_root=VIRTUAL_SANDBOX_ROOT)
+        middleware = FilesystemMiddleware(backend=backend)
+        execute_tool = next(t for t in middleware.tools if t.name == "execute")
+        read_tool = next(t for t in middleware.tools if t.name == "read_file")
+        return execute_tool, read_tool
+
+    @staticmethod
+    def _runtime(tool_call_id: str) -> ToolRuntime:
+        return ToolRuntime(
+            state={},
+            context=None,
+            tool_call_id=tool_call_id,
+            store=None,
+            stream_writer=lambda _: None,
+            config={},
+        )
+
+    @staticmethod
+    def _capture_path(tool_call_id: str) -> str:
+        return f"{VIRTUAL_SANDBOX_ROOT}/large_tool_results/{tool_call_id}"
+
+    def test_small_output_returned_inline_and_leaves_no_file(self, tools: tuple, sandbox: LocalSubprocessSandbox) -> None:
+        execute_tool, _ = tools
+        result = execute_tool.invoke({"command": "echo hello", "runtime": self._runtime("c_small")})
+
+        assert "hello" in result.content
+        assert "exit code 0" in result.content
+        # Small results are not offloaded -- no pointer, and the capture file is removed.
+        assert "large_tool_results" not in result.content
+        listing = sandbox.execute(f"ls {VIRTUAL_SANDBOX_ROOT}/large_tool_results/ 2>/dev/null | wc -l")
+        assert listing.output.strip() == "0"
+
+    def test_large_output_offloads_and_full_content_roundtrips(self, tools: tuple) -> None:
+        execute_tool, read_tool = tools
+        rt = self._runtime("c_large")
+        result = execute_tool.invoke({"command": _BIG_OUTPUT_CMD, "runtime": rt})
+
+        capture_path = self._capture_path("c_large")
+        # Preview + pointer, not the full output inline.
+        assert capture_path in result.content
+        assert "read_file" in result.content
+        assert "line 1:" in result.content  # head shown
+        assert "line 5000:" in result.content  # tail shown
+        assert "lines truncated" in result.content
+        # A middle line is absent from the preview...
+        assert "line 2500:" not in result.content
+
+        # ...but recoverable in full via read_file on the offload path: a middle
+        # slice the preview never showed is present on disk.
+        read = read_tool.invoke({"file_path": capture_path, "offset": 2499, "limit": 3, "runtime": rt})
+        assert "line 2500:" in read.content
+
+    def test_nonzero_exit_code_preserved(self, tools: tuple) -> None:
+        execute_tool, _ = tools
+        result = execute_tool.invoke({"command": "echo oops; exit 3", "runtime": self._runtime("c_ec")})
+
+        assert "oops" in result.content
+        assert "exit code 3" in result.content
+
+    def test_runaway_output_is_capped_and_flagged(self, tools: tuple, sandbox: LocalSubprocessSandbox, monkeypatch: pytest.MonkeyPatch) -> None:
+        # Cap must exceed the eviction budget so a capped result still offloads
+        # (rather than fitting inline). Default budget is ~80 KB.
+        cap = 100_000
+        monkeypatch.setattr("deepagents.backends.sandbox._EXECUTE_CAPTURE_MAX_BYTES", cap)
+
+        execute_tool, _ = tools
+        rt = self._runtime("c_cap")
+        # ~250 KB of output over the cap, but the command exits 0. The cap drains
+        # the excess instead of SIGPIPE-killing the producer, so the command's real
+        # exit code survives -- a regression guard: closing the pipe early would
+        # report this successful command as failed.
+        result = execute_tool.invoke({"command": f"{_BIG_OUTPUT_CMD}; exit 0", "runtime": rt})
+
+        assert "exceeded the capture size limit" in result.content
+        assert "succeeded with exit code 0" in result.content
+        # The on-disk capture file is bounded at the cap regardless of total output.
+        size = sandbox.execute(f"wc -c < {self._capture_path('c_cap')}").output.strip()
+        assert size == str(cap)
+
+    def test_enable_capture_offload_flag_controls_offload(self, sandbox: LocalSubprocessSandbox) -> None:
+        budget = 100  # small, so _BIG_OUTPUT_CMD would offload when capture is enabled
+
+        # Disabled -> command runs unwrapped: full output inline, not offloaded, no file.
+        sandbox.enable_capture_offload = False
+        off_path = self._capture_path("flag_off")
+        offload = sandbox.execute_with_offload(_BIG_OUTPUT_CMD, off_path, max_inline_bytes=budget)
+        assert offload.offloaded is False
+        assert "line 5000:" in offload.response.output  # full output returned, not a preview
+        assert "line 2500:" in offload.response.output
+        assert sandbox.execute(f"test -e {off_path} && echo Y || echo N").output.strip() == "N"
+
+        # Enabled -> offloaded to a file; only a head/tail preview is returned.
+        sandbox.enable_capture_offload = True
+        on_path = self._capture_path("flag_on")
+        offload = sandbox.execute_with_offload(_BIG_OUTPUT_CMD, on_path, max_inline_bytes=budget)
+        assert offload.offloaded is True
+        assert "line 2500:" not in offload.response.output  # middle omitted -> it's a preview

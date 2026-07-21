@@ -1,15 +1,16 @@
-"""StateBackend: Store files in LangGraph agent state (ephemeral)."""
+"""`StateBackend`: Store files in LangGraph agent state (ephemeral)."""
 
 import base64
-import warnings
 from typing import Any
 
 from langchain_core.runnables import RunnableConfig
 from langgraph._internal._constants import CONFIG_KEY_READ, CONFIG_KEY_SEND
 from langgraph.config import get_config
 
+from deepagents._api.deprecation import warn_deprecated
 from deepagents.backends.protocol import (
     BackendProtocol,
+    DeleteResult,
     EditResult,
     FileDownloadResponse,
     FileInfo,
@@ -18,6 +19,7 @@ from deepagents.backends.protocol import (
     WriteResult,
 )
 from deepagents.backends.utils import (
+    _get_backend_read_file_type,
     _glob_search_files,
     create_file_data,
     file_data_to_string,
@@ -57,12 +59,16 @@ class StateBackend(BackendProtocol):
                 plain `str` with an `encoding` field.
         """
         if runtime is not None:
-            warnings.warn(
-                "Passing `runtime` to StateBackend is deprecated and will be "
-                "removed in v0.7. StateBackend now reads and writes "
-                "state via `get_config()`. Simply use `StateBackend()` instead.",
-                DeprecationWarning,
-                stacklevel=2,
+            warn_deprecated(
+                since="0.5.0",
+                removal="0.7.0",
+                message=(
+                    "Passing `runtime` to `StateBackend` is deprecated and "
+                    "will be removed in deepagents==0.7.0. `StateBackend` now "
+                    "reads and writes state via `get_config()`. Use "
+                    "`StateBackend()` instead."
+                ),
+                package="deepagents",
             )
         self._file_format = file_format
 
@@ -101,14 +107,15 @@ class StateBackend(BackendProtocol):
         initialize StateBackend once and fetch state on demand from any
         graph context (tools, middleware nodes, etc.).
 
-        `fresh=False` reads the value as of the *start* of the current
-        superstep (checkpointed value + writes from prior steps). Writes
-        queued during the current step aren't applied until the node boundary,
-        so every call within the same step sees a consistent snapshot.
+        `fresh=True` applies any pending task writes through the channel's
+        reducer before returning, giving read-your-writes semantics within
+        a single superstep — e.g. a tool that writes a file and then reads
+        it back, or a code interpreter that issues multiple sub-tool calls
+        inside one eval.
         """
         config = self._get_config()
         read = config["configurable"][CONFIG_KEY_READ]
-        fresh = False
+        fresh = True
         return read("files", fresh) or {}
 
     def _send_files_update(self, update: dict[str, Any]) -> None:
@@ -125,9 +132,9 @@ class StateBackend(BackendProtocol):
         uses a dict-merge reducer, so we only need to include changed
         files — unchanged ones are preserved by the reducer.
 
-        Writes are not applied until the node boundary, so they won't be
-        visible to other calls in the same step (see `_read_files` and
-        its use of `fresh=False`).
+        Sends are visible to subsequent `_read_files` calls within the
+        same superstep via `fresh=True`; they are committed to state at
+        the node boundary.
         """
         config = self._get_config()
         send = config["configurable"][CONFIG_KEY_SEND]
@@ -149,8 +156,9 @@ class StateBackend(BackendProtocol):
             path: Absolute path to directory.
 
         Returns:
-            List of FileInfo-like dicts for files and directories directly in the directory.
-            Directories have a trailing / in their path and is_dir=True.
+            List of `FileInfo`-like dicts for files and directories directly in the directory.
+
+                Directories have a trailing `/` in their path and `is_dir=True`.
         """
         files = self._read_files()
         infos: list[FileInfo] = []
@@ -205,7 +213,9 @@ class StateBackend(BackendProtocol):
             limit: Maximum number of lines to read.
 
         Returns:
-            Formatted file content with line numbers, or error message.
+            `ReadResult` with raw (unformatted) content for the requested window.
+
+                Line-number formatting is applied by the middleware.
         """
         files = self._read_files()
         file_data = files.get(file_path)
@@ -213,37 +223,24 @@ class StateBackend(BackendProtocol):
         if file_data is None:
             return f"Error: File '{file_path}' not found"
 
-        if _get_file_type(file_path) != "text":
+        if _get_backend_read_file_type(file_path) != "text":
             return ReadResult(file_data=file_data)
 
-        sliced = slice_read_response(file_data, offset, limit)
-        if isinstance(sliced, ReadResult):
-            return sliced
-        sliced_fd = FileData(
-            content=sliced,
-            encoding=file_data.get("encoding", "utf-8"),
-        )
-        if "created_at" in file_data:
-            sliced_fd["created_at"] = file_data["created_at"]
-        if "modified_at" in file_data:
-            sliced_fd["modified_at"] = file_data["modified_at"]
-        return ReadResult(file_data=sliced_fd)
+        return slice_read_response(file_data, offset, limit)
 
     def write(
         self,
         file_path: str,
         content: str,
     ) -> WriteResult:
-        """Create a new file with content.
+        """Write content to a file, creating it or overwriting it if it already exists.
 
         The update is queued directly via `CONFIG_KEY_SEND`.
         """
         files = self._read_files()
 
-        if file_path in files:
-            return WriteResult(error=f"Cannot write to {file_path} because it already exists. Read and then make an edit, or write to a new path.")
-
-        new_file_data = create_file_data(content)
+        existing = files.get(file_path)
+        new_file_data = update_file_data(existing, content) if existing is not None else create_file_data(content)
         self._send_files_update({file_path: self._prepare_for_storage(new_file_data)})
         return WriteResult(path=file_path)
 
@@ -275,18 +272,46 @@ class StateBackend(BackendProtocol):
         self._send_files_update({file_path: self._prepare_for_storage(new_file_data)})
         return EditResult(path=file_path, occurrences=int(occurrences))
 
-    def grep_raw(
+    def delete(self, file_path: str) -> DeleteResult:
+        """Delete a file or directory from state.
+
+        Deleting a path removes the exact file at `file_path` plus every nested
+        key under it (the prefix `file_path` + "/"), so a directory is removed
+        recursively. Each removal is queued via `CONFIG_KEY_SEND` as a ``None``
+        value, which the `files` channel reducer interprets as a deletion marker.
+
+        Args:
+            file_path: Path of the file or directory to delete.
+
+        Returns:
+            `DeleteResult` with `file_path` on success, or an error if nothing is
+                stored at or under it.
+        """
+        files = self._read_files()
+
+        base = file_path.rstrip("/")
+        prefix = base + "/"
+        to_delete = [key for key in files if key == base or key.startswith(prefix)]
+        if not to_delete:
+            return DeleteResult(error=f"Error: File '{file_path}' not found")
+
+        self._send_files_update(dict.fromkeys(to_delete, None))
+        return DeleteResult(path=file_path)
+
+    def grep(
         self,
         pattern: str,
         path: str | None = None,
         glob: str | None = None,
-    ) -> list[GrepMatch] | str:
+        *,
+        max_count: int | None = None,
+    ) -> GrepResult:
         """Search state files for a literal text pattern."""
         files = self._read_files()
-        return grep_matches_from_files(files, pattern, path if path is not None else "/", glob)
+        return grep_matches_from_files(files, pattern, path if path is not None else "/", glob, max_count=max_count)
 
-    def glob_info(self, pattern: str, path: str = "/") -> list[FileInfo]:
-        """Get FileInfo for files matching glob pattern."""
+    def glob(self, pattern: str, path: str | None = None) -> GlobResult:
+        """Get `FileInfo` for files matching glob pattern."""
         files = self._read_files()
         result = _glob_search_files(files, pattern, path)
         if result == "No files found":
@@ -310,10 +335,10 @@ class StateBackend(BackendProtocol):
         """Upload multiple files to state.
 
         Args:
-            files: List of (path, content) tuples to upload
+            files: List of `(path, content)` tuples to upload
 
         Returns:
-            List of FileUploadResponse objects, one per input file
+            List of `FileUploadResponse` objects, one per input file
         """
         existing = self._read_files()
         responses: list[FileUploadResponse] = []
@@ -340,7 +365,7 @@ class StateBackend(BackendProtocol):
             paths: List of file paths to download
 
         Returns:
-            List of FileDownloadResponse objects, one per input path
+            List of `FileDownloadResponse` objects, one per input path
         """
         state_files = self._read_files()
         responses: list[FileDownloadResponse] = []

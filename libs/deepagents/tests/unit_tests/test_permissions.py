@@ -1,16 +1,31 @@
-"""Unit tests for FilesystemPermission and _PermissionMiddleware."""
+"""Unit tests for filesystem permission enforcement in `FilesystemMiddleware`."""
+
+import threading
 
 import pytest
 from langchain.tools import ToolRuntime
 from langchain.tools.tool_node import ToolCallRequest
-from langchain_core.messages import ToolMessage
+from langchain_core.language_models.fake_chat_models import GenericFakeChatModel
+from langchain_core.messages import AIMessage, ToolMessage
 from langgraph.store.memory import InMemoryStore
 
-from deepagents.backends import StoreBackend
+from deepagents.backends import StateBackend, StoreBackend
 from deepagents.backends.composite import CompositeBackend
-from deepagents.backends.protocol import ExecuteResponse, SandboxBackendProtocol
-from deepagents.middleware.filesystem import FilesystemMiddleware
-from deepagents.middleware.permissions import FilesystemPermission, _check_fs_permission, _filter_paths_by_permission, _PermissionMiddleware
+from deepagents.backends.filesystem import FilesystemBackend
+from deepagents.backends.protocol import EditResult, ExecuteResponse, GlobResult, ReadResult, SandboxBackendProtocol, WriteResult
+from deepagents.backends.utils import _glob_anchor, _paths_overlap
+from deepagents.graph import create_deep_agent
+from deepagents.middleware import filesystem as filesystem_module
+from deepagents.middleware._fs_interrupt import _build_interrupt_on_from_permissions, _make_fs_when_predicate
+from deepagents.middleware.filesystem import (
+    FilesystemMiddleware,
+    FilesystemPermission,
+    _all_paths_scoped_to_routes,
+    _check_fs_permission,
+    _filter_paths_by_permission,
+    _find_delete_deny_patterns,
+)
+from deepagents.middleware.subagents import GENERAL_PURPOSE_SUBAGENT
 
 
 def _runtime(tool_call_id: str = "") -> ToolRuntime:
@@ -30,23 +45,36 @@ def _make_backend(files: dict | None = None) -> StoreBackend:
 
 
 def _invoke_with_permissions(tool, args, rules, tool_call_id="test", backend=None):
-    """Invoke a tool through _PermissionMiddleware, return the content string."""
-    perm = _PermissionMiddleware(rules=rules, backend=backend or _make_backend())
+    """Invoke a FilesystemMiddleware tool configured with permissions."""
+    resolved_backend = backend
+    if resolved_backend is None:
+        parent = getattr(tool, "func", None)
+        if parent is not None:
+            closure = getattr(parent, "__closure__", None) or ()
+            for cell in closure:
+                candidate = getattr(cell, "cell_contents", None)
+                if isinstance(candidate, FilesystemMiddleware):
+                    resolved_backend = candidate.backend
+                    break
+    if resolved_backend is None:
+        resolved_backend = _make_backend()
+    configured_middleware = FilesystemMiddleware(backend=resolved_backend, _permissions=rules)
+    configured_tool = next(t for t in configured_middleware.tools if t.name == tool.name)
     runtime = _runtime(tool_call_id)
 
     def handler(_req):
-        raw = tool.invoke({**args, "runtime": runtime})
+        raw = configured_tool.invoke({**args, "runtime": runtime})
         if isinstance(raw, ToolMessage):
             return raw
-        return ToolMessage(content=str(raw), tool_call_id=tool_call_id, name=tool.name)
+        return ToolMessage(content=str(raw), tool_call_id=tool_call_id, name=configured_tool.name)
 
     request = ToolCallRequest(
         runtime=runtime,
-        tool_call={"id": tool_call_id, "name": tool.name, "args": args},
+        tool_call={"id": tool_call_id, "name": configured_tool.name, "args": args},
         state={},
-        tool=tool,
+        tool=configured_tool,
     )
-    result = perm.wrap_tool_call(request, handler)
+    result = configured_middleware.wrap_tool_call(request, handler)
     if isinstance(result, ToolMessage):
         return result.content
     return str(result)
@@ -54,25 +82,269 @@ def _invoke_with_permissions(tool, args, rules, tool_call_id="test", backend=Non
 
 async def _ainvoke_with_permissions(tool, args, rules, tool_call_id="test", backend=None):
     """Async version of _invoke_with_permissions."""
-    perm = _PermissionMiddleware(rules=rules, backend=backend or _make_backend())
+    resolved_backend = backend
+    if resolved_backend is None:
+        parent = getattr(tool, "func", None)
+        if parent is not None:
+            closure = getattr(parent, "__closure__", None) or ()
+            for cell in closure:
+                candidate = getattr(cell, "cell_contents", None)
+                if isinstance(candidate, FilesystemMiddleware):
+                    resolved_backend = candidate.backend
+                    break
+    if resolved_backend is None:
+        resolved_backend = _make_backend()
+    configured_middleware = FilesystemMiddleware(backend=resolved_backend, _permissions=rules)
+    configured_tool = next(t for t in configured_middleware.tools if t.name == tool.name)
     runtime = _runtime(tool_call_id)
 
     async def handler(_req):
-        raw = await tool.ainvoke({**args, "runtime": runtime})
+        raw = await configured_tool.ainvoke({**args, "runtime": runtime})
         if isinstance(raw, ToolMessage):
             return raw
-        return ToolMessage(content=str(raw), tool_call_id=tool_call_id, name=tool.name)
+        return ToolMessage(content=str(raw), tool_call_id=tool_call_id, name=configured_tool.name)
 
     request = ToolCallRequest(
         runtime=runtime,
-        tool_call={"id": tool_call_id, "name": tool.name, "args": args},
+        tool_call={"id": tool_call_id, "name": configured_tool.name, "args": args},
         state={},
-        tool=tool,
+        tool=configured_tool,
     )
-    result = await perm.awrap_tool_call(request, handler)
+    result = await configured_middleware.awrap_tool_call(request, handler)
     if isinstance(result, ToolMessage):
         return result.content
     return str(result)
+
+
+class TestRecursiveDeletePermissions:
+    """All-or-nothing write-permission enforcement for recursive delete.
+
+    A recursive delete is refused if any ``deny`` write rule's pattern overlaps
+    the target subtree, in either direction: a rule scoped inside the target
+    (``/work/secrets/**``) and a rule the target falls under (``/work``) both
+    block it. The check is rule-based (no filesystem enumeration).
+    """
+
+    def _fs_backend(self, tmp_path):
+        # /work/a.txt, /work/logs/run.log, /work/secrets/{key,token}.txt
+        (tmp_path / "work" / "logs").mkdir(parents=True)
+        (tmp_path / "work" / "secrets").mkdir(parents=True)
+        (tmp_path / "work" / "a.txt").write_text("a")
+        (tmp_path / "work" / "logs" / "run.log").write_text("log")
+        (tmp_path / "work" / "secrets" / "key.txt").write_text("k")
+        (tmp_path / "work" / "secrets" / "token.txt").write_text("t")
+        return FilesystemBackend(root_dir=str(tmp_path), virtual_mode=True)
+
+    def test_recursive_delete_refused_when_descendant_denied(self, tmp_path):
+        backend = self._fs_backend(tmp_path)
+        rules = [FilesystemPermission(operations=["write"], paths=["/work/secrets/**"], mode="deny")]
+        tool = next(t for t in FilesystemMiddleware(backend=backend).tools if t.name == "delete")
+
+        result = _invoke_with_permissions(tool, {"file_path": "/work"}, rules, backend=backend)
+
+        assert "permission denied for write" in result
+        assert "/work/secrets" in result
+        # All-or-nothing: nothing was removed.
+        assert (tmp_path / "work" / "a.txt").exists()
+        assert (tmp_path / "work" / "secrets" / "key.txt").exists()
+
+    def test_recursive_delete_allowed_when_whole_subtree_allowed(self, tmp_path):
+        backend = self._fs_backend(tmp_path)
+        rules = [FilesystemPermission(operations=["write"], paths=["/other/**"], mode="deny")]
+        tool = next(t for t in FilesystemMiddleware(backend=backend).tools if t.name == "delete")
+
+        result = _invoke_with_permissions(tool, {"file_path": "/work"}, rules, backend=backend)
+
+        assert "Deleted" in result
+        assert not (tmp_path / "work").exists()
+
+    def test_delete_denied_directory_path_itself(self, tmp_path):
+        # A rule on the bare directory path (no /**) still blocks deleting it.
+        backend = self._fs_backend(tmp_path)
+        rules = [FilesystemPermission(operations=["write"], paths=["/work/secrets"], mode="deny")]
+        tool = next(t for t in FilesystemMiddleware(backend=backend).tools if t.name == "delete")
+
+        result = _invoke_with_permissions(tool, {"file_path": "/work"}, rules, backend=backend)
+
+        assert "permission denied for write" in result
+        assert (tmp_path / "work" / "secrets" / "key.txt").exists()
+
+    def test_delete_refused_when_ancestor_denied(self, tmp_path):
+        # Any overlap denies: a rule on an ancestor of the target also blocks,
+        # since the target subtree falls under it.
+        backend = self._fs_backend(tmp_path)
+        rules = [FilesystemPermission(operations=["write"], paths=["/work/**"], mode="deny")]
+        tool = next(t for t in FilesystemMiddleware(backend=backend).tools if t.name == "delete")
+
+        result = _invoke_with_permissions(tool, {"file_path": "/work/logs"}, rules, backend=backend)
+
+        assert "permission denied for write" in result
+        assert (tmp_path / "work" / "logs" / "run.log").exists()
+
+    def test_delete_unaffected_sibling_subtree(self, tmp_path):
+        backend = self._fs_backend(tmp_path)
+        rules = [FilesystemPermission(operations=["write"], paths=["/work/secrets", "/work/secrets/**"], mode="deny")]
+        tool = next(t for t in FilesystemMiddleware(backend=backend).tools if t.name == "delete")
+
+        result = _invoke_with_permissions(tool, {"file_path": "/work/logs"}, rules, backend=backend)
+
+        assert "Deleted" in result
+        assert not (tmp_path / "work" / "logs").exists()
+        assert (tmp_path / "work" / "secrets" / "key.txt").exists()
+
+    def test_delete_reports_multiple_overlapping_patterns(self, tmp_path):
+        # The agent gets context: several overlapping deny patterns are reported.
+        backend = self._fs_backend(tmp_path)
+        rules = [
+            FilesystemPermission(operations=["write"], paths=["/work/secrets/**"], mode="deny"),
+            FilesystemPermission(operations=["write"], paths=["/work/logs/**"], mode="deny"),
+        ]
+        tool = next(t for t in FilesystemMiddleware(backend=backend).tools if t.name == "delete")
+
+        result = _invoke_with_permissions(tool, {"file_path": "/work"}, rules, backend=backend)
+
+        assert "/work/secrets/**" in result
+        assert "/work/logs/**" in result
+        assert (tmp_path / "work" / "a.txt").exists()
+
+    def test_single_file_delete_still_works(self, tmp_path):
+        backend = self._fs_backend(tmp_path)
+        tool = next(t for t in FilesystemMiddleware(backend=backend).tools if t.name == "delete")
+
+        result = _invoke_with_permissions(tool, {"file_path": "/work/a.txt"}, [], backend=backend)
+
+        assert "Deleted" in result
+        assert not (tmp_path / "work" / "a.txt").exists()
+
+    async def test_recursive_delete_refused_async(self, tmp_path):
+        backend = self._fs_backend(tmp_path)
+        rules = [FilesystemPermission(operations=["write"], paths=["/work/secrets/**"], mode="deny")]
+        tool = next(t for t in FilesystemMiddleware(backend=backend).tools if t.name == "delete")
+
+        result = await _ainvoke_with_permissions(tool, {"file_path": "/work"}, rules, backend=backend)
+
+        assert "permission denied for write" in result
+        assert (tmp_path / "work" / "secrets" / "key.txt").exists()
+
+    def test_delete_registered_as_bulk_interrupt(self):
+        # An interrupt rule on a descendant must fire for a recursive delete,
+        # so delete is registered (bulk scope) in the interrupt builder.
+        rules = [FilesystemPermission(operations=["write"], paths=["/work/secrets/**"], mode="interrupt")]
+        out = _build_interrupt_on_from_permissions(rules)
+        assert "delete" in out
+
+
+def _deny(*paths: str) -> FilesystemPermission:
+    return FilesystemPermission(operations=["write"], paths=list(paths), mode="deny")
+
+
+class TestFindDeleteDenyPatterns:
+    """Exhaustive unit tests for the pure `_find_delete_deny_patterns` helper.
+
+    Returns every `deny` write pattern whose glob overlaps the delete subtree
+    (target + descendants). An empty result means the delete is permitted.
+    """
+
+    @pytest.mark.parametrize(
+        ("pattern", "target", "expected"),
+        [
+            # --- no overlap -> permitted (empty result) ----------------------
+            pytest.param("/other/**", "/work", [], id="unrelated-subtree"),
+            pytest.param("/workshop/**", "/work", [], id="sibling-prefix-glob"),
+            pytest.param("/work2", "/work", [], id="sibling-prefix-literal"),
+            pytest.param("/work/secrets", "/work/logs", [], id="sibling-leaf"),
+            # Single-component file glob: non-matching siblings are allowed
+            pytest.param("/work/*.log", "/work/notes.txt", [], id="file-glob-does-not-block-non-matching-sibling"),
+            # Single-component wildcard: ancestor that matches the glob blocks
+            # delete of its descendants (wildcard-denied dirs get the same
+            # protection as literal-denied dirs)
+            pytest.param("/work/*", "/work/app/child", ["/work/*"], id="wildcard-ancestor-blocks-descendant-delete"),
+            pytest.param("/work/*.log", "/work/app.log/child", ["/work/*.log"], id="file-glob-ancestor-blocks-descendant-delete"),
+            pytest.param("/work/*", "/work/app/deep/nested", ["/work/*"], id="wildcard-ancestor-blocks-deep-descendant-delete"),
+            # Directory wildcard after anchor: target below anchor is blocked (fail closed)
+            pytest.param("/work/*/secrets", "/work/app", ["/work/*/secrets"], id="dir-wildcard-blocks-ancestor-target"),
+            pytest.param("/work/**/secrets", "/work/app", ["/work/**/secrets"], id="globstar-wildcard-blocks-ancestor-target"),
+            # Recursive glob with suffix: deleting /work/sub would remove /work/sub/a.log
+            pytest.param("/work/**/*.log", "/work/sub", ["/work/**/*.log"], id="recursive-glob-blocks-descendant-that-contains-match"),
+            # --- glob that matches the target itself -> blocked --------------
+            # Guards the linchpin: the "allow non-matching sibling" path is only
+            # safe because a target that matches the glob is blocked first. If
+            # this direct-match check regresses, a denied file becomes deletable.
+            pytest.param("/work/*.log", "/work/app.log", ["/work/*.log"], id="file-glob-blocks-matching-target"),
+            pytest.param("/work/*", "/work/app", ["/work/*"], id="single-wildcard-blocks-matching-child"),
+            # Non-`*` wildcard classes (brace, char-class, `?`) are supported via
+            # BRACE|GLOBSTAR flags and the `_GLOB_WILDCARD_CHARS` frozenset.
+            pytest.param("/work/{secrets,keys}", "/work/secrets", ["/work/{secrets,keys}"], id="brace-glob-blocks-matching"),
+            pytest.param("/work/[ab].txt", "/work/a.txt", ["/work/[ab].txt"], id="charclass-glob-blocks-matching"),
+            pytest.param("/work/f?le.txt", "/work/other.txt", [], id="question-glob-non-matching-sibling-allowed"),
+            # --- overlap in either direction -> blocked ----------------------
+            pytest.param("/work/a.txt", "/work/a.txt", ["/work/a.txt"], id="exact-file"),
+            pytest.param("/work", "/work", ["/work"], id="exact-dir-literal"),
+            pytest.param("/work/secrets/**", "/work", ["/work/secrets/**"], id="descendant-pattern-blocks-ancestor-target"),
+            pytest.param("/work/**", "/work/logs", ["/work/**"], id="ancestor-glob-blocks-descendant-target"),
+            pytest.param("/work", "/work/sub/deep", ["/work"], id="ancestor-literal-blocks-descendant-target"),
+            pytest.param("/work/secrets", "/work", ["/work/secrets"], id="bare-directory-pattern"),
+            # --- wildcard / root anchors -------------------------------------
+            pytest.param("/anything/**", "/", ["/anything/**"], id="root-target-blocked-by-any-rule"),
+            pytest.param("/**/secrets", "/work", ["/**/secrets"], id="leading-wildcard-anchor-is-root"),
+            # --- trailing-slash normalization (both sides) -------------------
+            pytest.param("/work/**", "/work/", ["/work/**"], id="target-trailing-slash"),
+            pytest.param("/work/", "/work/sub", ["/work/"], id="pattern-trailing-slash"),
+            pytest.param("/work/", "/work/", ["/work/"], id="both-trailing-slash"),
+        ],
+    )
+    def test_overlap_geometry(self, pattern: str, target: str, expected: list[str]):
+        assert _find_delete_deny_patterns([_deny(pattern)], target) == expected
+
+    @pytest.mark.parametrize(
+        ("operations", "mode", "expected"),
+        [
+            pytest.param(["write"], "deny", ["/work/**"], id="write-deny-blocks"),
+            pytest.param(["read", "write"], "deny", ["/work/**"], id="readwrite-deny-blocks"),
+            pytest.param(["write"], "allow", [], id="allow-ignored"),
+            pytest.param(["write"], "interrupt", [], id="interrupt-ignored"),
+            pytest.param(["read"], "deny", [], id="read-only-deny-ignored"),
+        ],
+    )
+    def test_mode_and_operation_filtering(self, operations, mode, expected):
+        # Only deny + write rules count; the target always overlaps the pattern.
+        rule = FilesystemPermission(operations=operations, paths=["/work/**"], mode=mode)
+        assert _find_delete_deny_patterns([rule], "/work") == expected
+
+    @pytest.mark.parametrize(
+        ("rule_paths", "target", "expected"),
+        [
+            pytest.param([], "/work", [], id="no-permissions"),
+            pytest.param([["/work/a/**"], ["/work/b/**"]], "/work", ["/work/a/**", "/work/b/**"], id="multiple-rules"),
+            pytest.param(
+                [["/work/a/**", "/work/b/**", "/other/**"]],
+                "/work",
+                ["/work/a/**", "/work/b/**"],
+                id="multiple-paths-one-rule-filters-non-overlapping",
+            ),
+            pytest.param(
+                [[f"/work/d{i}/**"] for i in range(8)],
+                "/work",
+                [f"/work/d{i}/**" for i in range(8)],
+                id="all-overlapping-no-cap",
+            ),
+            pytest.param(
+                [["/work/x/**"], ["/work/x/**", "/work/y/**"]],
+                "/work",
+                ["/work/x/**", "/work/y/**"],
+                id="deduplicated-first-seen-order",
+            ),
+            pytest.param(
+                [["/other/**"], ["/work/x/**"], ["/elsewhere/**"]],
+                "/work",
+                ["/work/x/**"],
+                id="only-overlapping-returned",
+            ),
+        ],
+    )
+    def test_multiple_rule_aggregation(self, rule_paths, target, expected):
+        rules = [_deny(*paths) for paths in rule_paths]
+        assert _find_delete_deny_patterns(rules, target) == expected
 
 
 class TestFilesystemPermission:
@@ -105,75 +377,233 @@ class TestFilesystemPermission:
         with pytest.raises(NotImplementedError, match="must not contain '~'"):
             FilesystemPermission(operations=["read"], paths=["/~/data/**"])
 
+    def test_backslash_path_with_dotdot_raises(self):
+        r"""`FilesystemPermission` normalizes backslashes before traversal checks.
 
-class TestPermissionMiddleware:
+        A Windows-style path with `\..\` escaping a leading-slash prefix must
+        still be rejected: without normalization, `PurePosixPath(r"/a\..\b").parts`
+        yields the single component `r"a\..\b"` and the `'..' in parts` guard
+        would never fire, letting a traversal pattern slip past.
+        """
+        with pytest.raises(ValueError, match=r"must not contain '\.\.'"):
+            FilesystemPermission(operations=["read"], paths=["/workspace\\..\\secrets\\**"])
+
+    def test_mixed_separator_path_with_dotdot_raises(self):
+        """Mixed separators must also be rejected when they contain traversal."""
+        with pytest.raises(ValueError, match=r"must not contain '\.\.'"):
+            FilesystemPermission(operations=["read"], paths=["/workspace/..\\secrets/**"])
+
+    def test_backslash_path_without_traversal_accepted(self):
+        r"""Backslashes alone must not be rejected -- only `..` components are.
+
+        After `to_posix_path`, a path like `/workspace\sub` becomes `/workspace/sub`,
+        which has no traversal components and should pass validation.
+        """
+        rule = FilesystemPermission(operations=["read"], paths=["/workspace\\sub\\**"])
+        assert rule.paths == ["/workspace\\sub\\**"]
+
+    def test_interrupt_mode_accepted(self):
+        rule = FilesystemPermission(operations=["write"], paths=["/secrets/**"], mode="interrupt")
+        assert rule.mode == "interrupt"
+
+
+class _FakeReq:
+    """Stand-in for ToolCallRequest; we only read `tool_call['args']` in the predicate."""
+
+    def __init__(self, args: dict) -> None:
+        self.tool_call = {"args": args}
+
+
+class TestCheckFsPermissionInterrupt:
+    @pytest.mark.parametrize(
+        ("path", "expected"),
+        [
+            ("/secrets/x.txt", "interrupt"),
+            ("/workspace/x.txt", "allow"),
+        ],
+    )
+    def test_interrupt_rule_resolution(self, path, expected):
+        rules = [FilesystemPermission(operations=["write"], paths=["/secrets/**"], mode="interrupt")]
+        assert _check_fs_permission(rules, "write", path) == expected
+
+    def test_deny_rule_takes_precedence_when_listed_first(self):
+        """First-match wins; if deny is listed first, it beats a later interrupt rule."""
+        rules = [
+            FilesystemPermission(operations=["write"], paths=["/secrets/**"], mode="deny"),
+            FilesystemPermission(operations=["write"], paths=["/secrets/**"], mode="interrupt"),
+        ]
+        assert _check_fs_permission(rules, "write", "/secrets/x.txt") == "deny"
+
+    def test_filter_paths_does_not_drop_interrupt_paths(self):
+        """Interrupt-mode paths must remain in result-filtered lists.
+
+        The pre-execution `when` predicate is scope-aware: it fires before the
+        tool runs for both exact-path tools and bulk-path tools (including the
+        pathless and parent-path cases), so by the time result-filtering runs
+        the user has either approved or the call was rejected. Stripping
+        interrupt-mode results here would silently empty out a listing the
+        user just approved.
+        """
+        rules = [FilesystemPermission(operations=["read"], paths=["/secret/**"], mode="interrupt")]
+        kept = _filter_paths_by_permission(rules, "read", ["/secret/a.txt", "/public/b.txt"])
+        assert kept == ["/secret/a.txt", "/public/b.txt"]
+
+
+class TestBuildInterruptOnFromPermissions:
+    def test_empty_when_no_rules(self):
+        assert _build_interrupt_on_from_permissions([]) == {}
+
+    def test_empty_when_no_interrupt_rules(self):
+        rules = [FilesystemPermission(operations=["write"], paths=["/secrets/**"], mode="deny")]
+        assert _build_interrupt_on_from_permissions(rules) == {}
+
+    def test_registers_only_tools_whose_op_could_interrupt(self):
+        """A write-only interrupt rule registers only the write-op tools."""
+        rule = FilesystemPermission(operations=["write"], paths=["/secrets/**"], mode="interrupt")
+        out = _build_interrupt_on_from_permissions([rule])
+        assert set(out) == {"write_file", "edit_file", "delete"}
+
+    def test_registers_read_tools_for_read_interrupt(self):
+        rule = FilesystemPermission(operations=["read"], paths=["/secrets/**"], mode="interrupt")
+        out = _build_interrupt_on_from_permissions([rule])
+        assert set(out) == {"ls", "read_file", "glob", "grep"}
+
+    @pytest.mark.parametrize(
+        ("file_path", "expected"),
+        [
+            # literal match inside the rule's subtree
+            ("/secrets/key.pem", True),
+            # outside the rule
+            ("/workspace/x.txt", False),
+            # the parent dir itself doesn't match `/secrets/**` (** requires content after the slash)
+            ("/secrets", False),
+        ],
+    )
+    def test_exact_predicate(self, file_path, expected):
+        """Exact-scope tools fire iff the literal path arg matches the rule."""
+        rule = FilesystemPermission(operations=["write"], paths=["/secrets/**"], mode="interrupt")
+        when = _make_fs_when_predicate([rule], "write", "file_path", "exact")
+        assert when(_FakeReq({"file_path": file_path})) is expected
+
+    @pytest.mark.parametrize(
+        ("args", "expected"),
+        [
+            # pathless: can't localize → fire
+            ({"path": None}, True),
+            ({}, True),
+            # current-dir aliases collapse to root → fire
+            ({"path": "."}, True),
+            ({"path": ""}, True),
+            ({"path": "./"}, True),
+            ({"path": "/."}, True),
+            ({"path": "/"}, True),
+            # ancestor of the rule's anchor → fire (listing surfaces protected children)
+            ({"path": "/secrets"}, True),
+            # inside the rule's subtree → fire
+            ({"path": "/secrets/sub"}, True),
+            # unrelated subtree → no fire
+            ({"path": "/workspace"}, False),
+            # prefix lookalike — component-aware match, not string prefix
+            ({"path": "/secret"}, False),
+            # path-validation failure short-circuits to no interrupt
+            ({"path": "/secrets/../etc/passwd"}, False),
+        ],
+    )
+    def test_bulk_predicate(self, args, expected):
+        """Bulk-scope tools fire when the call subtree could intersect a rule.
+
+        Covers the HITL-bypass regressions for pathless calls and current-dir
+        aliases like `"."`/`""`/`"./"`: `validate_path` collapses those to
+        `/.`, which doesn't string-prefix any anchor, so the predicate
+        previously returned False and an agent could call e.g. `grep(pattern,
+        path=".")` to read interrupt-protected paths with no HITL prompt.
+        """
+        rule = FilesystemPermission(operations=["read"], paths=["/secrets/**"], mode="interrupt")
+        when = _make_fs_when_predicate([rule], "read", "path", "bulk")
+        assert when(_FakeReq(args)) is expected
+
+    @pytest.mark.parametrize(
+        ("args", "expected"),
+        [
+            # Absolute pattern: Python `glob` ignores `path` (the backend's
+            # `os.chdir(path)` has no effect on an absolute pattern), so gate on
+            # the pattern's own anchor. A benign `path` must not suppress the
+            # interrupt when the pattern reaches into a protected subtree.
+            ({"pattern": "/secrets/**", "path": "/workspace"}, True),
+            ({"pattern": "/secrets/sub/*.txt", "path": "/workspace"}, True),
+            # Absolute pattern anchored at root → overlaps everything → fire.
+            ({"pattern": "/**/key.pem", "path": "/workspace"}, True),
+            # Absolute pattern outside any interrupt rule → no fire.
+            ({"pattern": "/workspace/**", "path": "/workspace"}, False),
+            # Relative pattern climbing out of `path` via `..` can't be
+            # localized statically → fire conservatively.
+            ({"pattern": "../secrets/*", "path": "/workspace"}, True),
+            ({"pattern": "../../etc/*", "path": "/workspace/sub"}, True),
+            # Benign relative pattern under a non-overlapping path → no fire.
+            ({"pattern": "*.txt", "path": "/workspace"}, False),
+            # Relative pattern under the protected subtree still fires via the
+            # existing `path` check.
+            ({"pattern": "*.txt", "path": "/secrets"}, True),
+        ],
+    )
+    def test_bulk_glob_pattern_arg(self, args, expected):
+        """The glob bulk predicate gates on its `pattern` arg, not just `path`.
+
+        Regression for the HITL bypass where `glob(pattern="/secrets/**",
+        path="/workspace")` slipped past an interrupt rule on `/secrets/**`:
+        the predicate saw only the benign `/workspace` path while the sandbox
+        backend (`os.chdir(path)` then `glob.glob(pattern)`) enumerated
+        `/secrets` anyway, because Python's `glob` ignores the working
+        directory for absolute patterns.
+        """
+        rule = FilesystemPermission(operations=["read"], paths=["/secrets/**"], mode="interrupt")
+        when = _build_interrupt_on_from_permissions([rule])["glob"]["when"]
+        assert when(_FakeReq(args)) is expected
+
+
+class TestGlobAnchorAndOverlap:
+    @pytest.mark.parametrize(
+        ("pattern", "expected"),
+        [
+            ("/secrets/**", "/secrets"),
+            ("/a/*/b", "/a"),
+            ("/secrets/key.pem", "/secrets/key.pem"),
+            ("/*/foo", "/"),
+            ("/**/secrets", "/"),
+        ],
+    )
+    def test_glob_anchor(self, pattern, expected):
+        assert _glob_anchor(pattern) == expected
+
+    @pytest.mark.parametrize(
+        ("a", "b", "expected"),
+        [
+            # equal
+            ("/a/b", "/a/b", True),
+            # call inside rule
+            ("/a/b/c", "/a/b", True),
+            # rule inside call
+            ("/a", "/a/b", True),
+            # root overlaps everything, either direction
+            ("/", "/anywhere", True),
+            ("/anywhere", "/", True),
+            # component-aware: prefix lookalikes don't overlap
+            ("/secret", "/secrets", False),
+            ("/secrets", "/secret", False),
+            # disjoint
+            ("/workspace", "/secrets", False),
+        ],
+    )
+    def test_paths_overlap(self, a, b, expected):
+        assert _paths_overlap(a, b) is expected
+
+
+class TestFilesystemMiddlewarePermissionInit:
     def _backend(self):
         return _make_backend()
 
-    def _make_request(self, tool_name: str, args: dict, tool_call_id: str = "tc1"):
-        return ToolCallRequest(
-            runtime=_runtime(tool_call_id),
-            tool_call={"id": tool_call_id, "name": tool_name, "args": args},
-            state={},
-            tool=None,
-        )
-
-    def test_allow_passes_through(self):
-        middleware = _PermissionMiddleware(rules=[FilesystemPermission(operations=["read"], paths=["/workspace/**"])], backend=self._backend())
-        request = self._make_request("read_file", {"file_path": "/workspace/file.txt"})
-        expected = ToolMessage(content="ok", tool_call_id="tc1")
-
-        result = middleware.wrap_tool_call(request, lambda _: expected)
-        assert result is expected
-
-    def test_deny_returns_error_message(self):
-        middleware = _PermissionMiddleware(
-            rules=[FilesystemPermission(operations=["read"], paths=["/secrets/**"], mode="deny")], backend=self._backend()
-        )
-        request = self._make_request("read_file", {"file_path": "/secrets/key.txt"})
-
-        result = middleware.wrap_tool_call(request, lambda _: ToolMessage(content="should not reach", tool_call_id="tc1"))
-        assert isinstance(result, ToolMessage)
-        assert "permission denied" in result.content
-        assert result.tool_call_id == "tc1"
-        assert result.name == "read_file"
-        assert result.status == "error"
-
-    def test_unrelated_tool_allowed(self):
-        middleware = _PermissionMiddleware(
-            rules=[FilesystemPermission(operations=["read"], paths=["/secrets/**"], mode="deny")], backend=self._backend()
-        )
-        request = self._make_request("some_other_tool", {"input": "hello"})
-        expected = ToolMessage(content="content", tool_call_id="tc1")
-
-        result = middleware.wrap_tool_call(request, lambda _: expected)
-        assert result is expected
-
-    async def test_async_deny_returns_error_message(self):
-        middleware = _PermissionMiddleware(rules=[FilesystemPermission(operations=["write"], paths=["/**"], mode="deny")], backend=self._backend())
-        request = self._make_request("write_file", {"file_path": "/foo.txt", "content": "data"})
-
-        async def async_handler(_):
-            return ToolMessage(content="should not reach", tool_call_id="tc1")
-
-        result = await middleware.awrap_tool_call(request, async_handler)
-        assert isinstance(result, ToolMessage)
-        assert "permission denied" in result.content
-        assert result.status == "error"
-
-    async def test_async_allow_passes_through(self):
-        middleware = _PermissionMiddleware(rules=[FilesystemPermission(operations=["read"], paths=["/workspace/**"])], backend=self._backend())
-        request = self._make_request("read_file", {"file_path": "/workspace/file.txt"})
-        expected = ToolMessage(content="passed", tool_call_id="tc1")
-
-        async def async_handler(_):
-            return expected
-
-        result = await middleware.awrap_tool_call(request, async_handler)
-        assert result is expected
-
     def test_raises_not_implemented_for_sandbox_backend(self):
-        """_PermissionMiddleware rejects backends that support execution."""
+        """FilesystemMiddleware rejects permissions for backends that support execution."""
 
         class MockSandbox(SandboxBackendProtocol, StoreBackend):
             def execute(self, command: str, *, timeout: int | None = None) -> ExecuteResponse:
@@ -190,13 +620,13 @@ class TestPermissionMiddleware:
         sandbox = MockSandbox(store=mem_store, namespace=lambda _ctx: ("filesystem",))
 
         with pytest.raises(NotImplementedError, match="execute"):
-            _PermissionMiddleware(
-                rules=[FilesystemPermission(operations=["write"], paths=["/**"], mode="deny")],
+            FilesystemMiddleware(
                 backend=sandbox,
+                _permissions=[FilesystemPermission(operations=["write"], paths=["/**"], mode="deny")],
             )
 
     def test_raises_not_implemented_for_composite_with_sandbox_default(self):
-        """_PermissionMiddleware rejects CompositeBackend whose default supports execution."""
+        """FilesystemMiddleware rejects CompositeBackend whose default supports execution."""
 
         class MockSandbox(SandboxBackendProtocol, StoreBackend):
             def execute(self, command: str, *, timeout: int | None = None) -> ExecuteResponse:
@@ -214,19 +644,19 @@ class TestPermissionMiddleware:
         composite = CompositeBackend(default=sandbox, routes={})
 
         with pytest.raises(NotImplementedError, match="execute"):
-            _PermissionMiddleware(
-                rules=[FilesystemPermission(operations=["write"], paths=["/**"], mode="deny")],
+            FilesystemMiddleware(
                 backend=composite,
+                _permissions=[FilesystemPermission(operations=["write"], paths=["/**"], mode="deny")],
             )
 
     def test_allows_composite_without_sandbox_default(self):
-        """_PermissionMiddleware accepts CompositeBackend whose default does not support execution."""
+        """FilesystemMiddleware accepts CompositeBackend whose default does not support execution."""
         composite = CompositeBackend(default=self._backend(), routes={})
-        middleware = _PermissionMiddleware(
-            rules=[FilesystemPermission(operations=["read"], paths=["/secrets/**"], mode="deny")],
+        middleware = FilesystemMiddleware(
             backend=composite,
+            _permissions=[FilesystemPermission(operations=["read"], paths=["/secrets/**"], mode="deny")],
         )
-        assert middleware._fs_rules
+        assert middleware._permissions
 
     def test_allows_composite_with_sandbox_route_but_non_sandbox_default(self):
         """CompositeBackend with sandbox in a route but non-sandbox default is allowed.
@@ -249,11 +679,16 @@ class TestPermissionMiddleware:
         mem_store = InMemoryStore()
         sandbox = MockSandbox(store=mem_store, namespace=lambda _ctx: ("filesystem",))
         composite = CompositeBackend(default=self._backend(), routes={"/sandbox/": sandbox})
-        middleware = _PermissionMiddleware(
-            rules=[FilesystemPermission(operations=["read"], paths=["/secrets/**"], mode="deny")],
+        middleware = FilesystemMiddleware(
             backend=composite,
+            _permissions=[FilesystemPermission(operations=["read"], paths=["/secrets/**"], mode="deny")],
         )
-        assert middleware._fs_rules
+        assert middleware._permissions
+
+    def test_all_paths_scoped_to_routes_helper(self):
+        composite = CompositeBackend(default=self._backend(), routes={"/memories/": self._backend()})
+        rules = [FilesystemPermission(operations=["read"], paths=["/memories/**"], mode="deny")]
+        assert _all_paths_scoped_to_routes(rules, composite) is True
 
 
 class TestFilesystemMiddlewarePermissions:
@@ -274,6 +709,53 @@ class TestFilesystemMiddlewarePermissions:
         result = _invoke_with_permissions(read_tool, {"file_path": "/workspace/file.txt"}, rules)
         assert "permission denied" not in result
 
+    def test_read_binary_allowed_on_permitted_path(self):
+        class ImageBackend(StateBackend):
+            def read(self, path, *, offset=0, limit=100):
+                return ReadResult(file_data={"content": "<base64_data>", "encoding": "base64"})
+
+        middleware = FilesystemMiddleware(backend=ImageBackend())
+        read_tool = next(t for t in middleware.tools if t.name == "read_file")
+        rules = [FilesystemPermission(operations=["read"], paths=["/secrets/**"], mode="deny")]
+        result = _invoke_with_permissions(read_tool, {"file_path": "/app/screenshot.png"}, rules)
+        assert isinstance(result, list)
+        assert result[0]["type"] == "image"
+        assert result[0]["base64"] == "<base64_data>"
+
+    def test_read_binary_denied_on_restricted_path(self):
+        class ImageBackend(StateBackend):
+            def read(self, path, *, offset=0, limit=100):
+                return ReadResult(file_data={"content": "<base64_data>", "encoding": "base64"})
+
+        middleware = FilesystemMiddleware(backend=ImageBackend())
+        read_tool = next(t for t in middleware.tools if t.name == "read_file")
+        rules = [FilesystemPermission(operations=["read"], paths=["/secrets/**"], mode="deny")]
+        result = _invoke_with_permissions(read_tool, {"file_path": "/secrets/screenshot.png"}, rules)
+        assert "permission denied" in result
+        assert "read" in result
+
+    def test_read_backend_error_passthrough_when_allowed(self):
+        class ErrorBackend(StateBackend):
+            def read(self, path, *, offset=0, limit=100):
+                return ReadResult(error="file_not_found")
+
+        middleware = FilesystemMiddleware(backend=ErrorBackend())
+        read_tool = next(t for t in middleware.tools if t.name == "read_file")
+        rules = [FilesystemPermission(operations=["read"], paths=["/secrets/**"], mode="deny")]
+        result = _invoke_with_permissions(read_tool, {"file_path": "/workspace/missing.txt"}, rules)
+        assert result == "Error: file_not_found"
+
+    def test_read_first_matching_rule_wins_at_tool_level(self):
+        backend = _make_backend({"/secrets/key.txt": "top secret"})
+        middleware = FilesystemMiddleware(backend=backend)
+        read_tool = next(t for t in middleware.tools if t.name == "read_file")
+        rules = [
+            FilesystemPermission(operations=["read"], paths=["/secrets/**"], mode="deny"),
+            FilesystemPermission(operations=["read"], paths=["/secrets/**"], mode="allow"),
+        ]
+        result = _invoke_with_permissions(read_tool, {"file_path": "/secrets/key.txt"}, rules)
+        assert "permission denied" in result
+
     def test_write_denied_on_restricted_path(self):
         backend = _make_backend()
         middleware = FilesystemMiddleware(backend=backend)
@@ -282,6 +764,29 @@ class TestFilesystemMiddlewarePermissions:
         result = _invoke_with_permissions(write_tool, {"file_path": "/foo.txt", "content": "data"}, rules)
         assert "permission denied" in result
         assert "write" in result
+
+    def test_write_backend_error_passthrough_when_allowed(self):
+        class ErrorBackend(StateBackend):
+            def write(self, path, content):
+
+                return WriteResult(error="disk full", path=path)
+
+        middleware = FilesystemMiddleware(backend=ErrorBackend())
+        write_tool = next(t for t in middleware.tools if t.name == "write_file")
+        rules = [FilesystemPermission(operations=["write"], paths=["/secrets/**"], mode="deny")]
+        result = _invoke_with_permissions(write_tool, {"file_path": "/workspace/out.txt", "content": "data"}, rules)
+        assert result == "disk full"
+
+    def test_write_first_matching_rule_wins_at_tool_level(self):
+        backend = _make_backend()
+        middleware = FilesystemMiddleware(backend=backend)
+        write_tool = next(t for t in middleware.tools if t.name == "write_file")
+        rules = [
+            FilesystemPermission(operations=["write"], paths=["/workspace/**"], mode="deny"),
+            FilesystemPermission(operations=["write"], paths=["/workspace/**"], mode="allow"),
+        ]
+        result = _invoke_with_permissions(write_tool, {"file_path": "/workspace/out.txt", "content": "data"}, rules)
+        assert "permission denied" in result
 
     def test_edit_denied_on_restricted_path(self):
         backend = _make_backend({"/protected/file.txt": "original"})
@@ -292,6 +797,44 @@ class TestFilesystemMiddlewarePermissions:
             edit_tool,
             {
                 "file_path": "/protected/file.txt",
+                "old_string": "original",
+                "new_string": "changed",
+            },
+            rules,
+        )
+        assert "permission denied" in result
+
+    def test_edit_backend_error_passthrough_when_allowed(self):
+        class ErrorBackend(StateBackend):
+            def edit(self, path, old_string, new_string, *, replace_all=False):
+                return EditResult(error="no unique match", path=path, occurrences=0)
+
+        middleware = FilesystemMiddleware(backend=ErrorBackend())
+        edit_tool = next(t for t in middleware.tools if t.name == "edit_file")
+        rules = [FilesystemPermission(operations=["write"], paths=["/protected/**"], mode="deny")]
+        result = _invoke_with_permissions(
+            edit_tool,
+            {
+                "file_path": "/workspace/file.txt",
+                "old_string": "original",
+                "new_string": "changed",
+            },
+            rules,
+        )
+        assert result == "no unique match"
+
+    def test_edit_first_matching_rule_wins_at_tool_level(self):
+        backend = _make_backend({"/workspace/file.txt": "original"})
+        middleware = FilesystemMiddleware(backend=backend)
+        edit_tool = next(t for t in middleware.tools if t.name == "edit_file")
+        rules = [
+            FilesystemPermission(operations=["write"], paths=["/workspace/**"], mode="deny"),
+            FilesystemPermission(operations=["write"], paths=["/workspace/**"], mode="allow"),
+        ]
+        result = _invoke_with_permissions(
+            edit_tool,
+            {
+                "file_path": "/workspace/file.txt",
                 "old_string": "original",
                 "new_string": "changed",
             },
@@ -327,7 +870,7 @@ class TestFilesystemMiddlewarePermissions:
         middleware = FilesystemMiddleware(backend=backend)
         read_tool = next(t for t in middleware.tools if t.name == "read_file")
         result = read_tool.invoke({"runtime": _runtime(), "file_path": "/secrets/key.txt"})
-        assert "permission denied" not in result
+        assert "permission denied" not in result.content
 
     def test_ls_denied_on_restricted_root(self):
         backend = _make_backend({"/secrets/key.txt": "top secret"})
@@ -473,7 +1016,7 @@ class TestCanonicalizationBypass:
         middleware = FilesystemMiddleware(backend=backend)
         read_tool = next(t for t in middleware.tools if t.name == "read_file")
         result = read_tool.invoke({"runtime": _runtime(), "file_path": "/workspace/../secrets/key.txt"})
-        assert "Path traversal not allowed" in result
+        assert "Path traversal not allowed" in result.content
 
     def test_redundant_separators_normalized(self):
         # /secrets//key.txt is normalized by validate_path to /secrets/key.txt
@@ -507,6 +1050,51 @@ class TestCanonicalizationBypass:
 
 class TestGlobToolPermissions:
     """Tests for the glob tool permission checks in FilesystemMiddleware."""
+
+    def test_sync_glob_rejects_when_timed_out_workers_are_saturated(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        class BlockingGlobBackend(StoreBackend):
+            def __init__(self, *, release: threading.Event, started: threading.Semaphore) -> None:
+                super().__init__(store=InMemoryStore(), namespace=lambda _ctx: ("filesystem",))
+                self.release = release
+                self.started = started
+                self._calls = 0
+                self._lock = threading.Lock()
+
+            @property
+            def calls(self) -> int:
+                with self._lock:
+                    return self._calls
+
+            def glob(self, pattern: str, path: str | None = None) -> GlobResult:
+                with self._lock:
+                    self._calls += 1
+                self.started.release()
+                self.release.wait(timeout=5)
+                return GlobResult(matches=[])
+
+        monkeypatch.setattr(filesystem_module, "GLOB_TIMEOUT", 0.01)
+        release = threading.Event()
+        started = threading.Semaphore(0)
+        backend = BlockingGlobBackend(release=release, started=started)
+        middleware = FilesystemMiddleware(backend=backend)
+        glob_tool = next(t for t in middleware.tools if t.name == "glob")
+
+        try:
+            for idx in range(filesystem_module._SYNC_GLOB_WORKERS):
+                result = glob_tool.invoke({"runtime": _runtime(f"glob-{idx}"), "pattern": "**/*", "path": "/"})
+                assert "glob timed out" in result.content
+                assert started.acquire(timeout=1)
+
+            result = glob_tool.invoke({"runtime": _runtime("glob-saturated"), "pattern": "**/*", "path": "/"})
+
+            assert "too many glob calls are already running" in result.content
+            assert backend.calls == filesystem_module._SYNC_GLOB_WORKERS
+        finally:
+            release.set()
+            middleware._glob_executor.shutdown(wait=True)
 
     def test_glob_denied_on_restricted_base_path(self):
         backend = _make_backend({"/secrets/key.txt": "top secret"})
@@ -702,6 +1290,30 @@ class TestAsyncFilesystemMiddlewarePermissions:
         result = await _ainvoke_with_permissions(read_tool, {"file_path": "/workspace/file.txt"}, rules)
         assert "permission denied" not in result
 
+    async def test_read_binary_allowed_async(self):
+        class ImageBackend(StateBackend):
+            async def aread(self, path, *, offset=0, limit=100):
+                return ReadResult(file_data={"content": "<base64_data>", "encoding": "base64"})
+
+        middleware = FilesystemMiddleware(backend=ImageBackend())
+        read_tool = next(t for t in middleware.tools if t.name == "read_file")
+        rules = [FilesystemPermission(operations=["read"], paths=["/secrets/**"], mode="deny")]
+        result = await _ainvoke_with_permissions(read_tool, {"file_path": "/app/screenshot.png"}, rules)
+        assert isinstance(result, list)
+        assert result[0]["type"] == "image"
+        assert result[0]["base64"] == "<base64_data>"
+
+    async def test_read_backend_error_passthrough_async(self):
+        class ErrorBackend(StateBackend):
+            async def aread(self, path, *, offset=0, limit=100):
+                return ReadResult(error="file_not_found")
+
+        middleware = FilesystemMiddleware(backend=ErrorBackend())
+        read_tool = next(t for t in middleware.tools if t.name == "read_file")
+        rules = [FilesystemPermission(operations=["read"], paths=["/secrets/**"], mode="deny")]
+        result = await _ainvoke_with_permissions(read_tool, {"file_path": "/workspace/missing.txt"}, rules)
+        assert result == "Error: file_not_found"
+
     async def test_write_denied_async(self):
         backend = _make_backend()
         middleware = FilesystemMiddleware(backend=backend)
@@ -755,3 +1367,53 @@ class TestAsyncFilesystemMiddlewarePermissions:
         rules = [FilesystemPermission(operations=["read"], paths=["/secrets/**"], mode="deny")]
         result = await _ainvoke_with_permissions(ls_tool, {"path": "/"}, rules)
         assert "/secrets/b.txt" not in result
+
+
+def _filesystem_permissions_for(agent, subagent_name: str | None = None):
+    """Walk a compiled deep agent to fetch a `FilesystemMiddleware._permissions`.
+
+    When `subagent_name` is None, returns the main agent's permissions.
+    Otherwise descends into the named subagent registered on the `task` tool.
+    """
+    if subagent_name is not None:
+        task_tool = agent.nodes["tools"].bound._tools_by_name["task"]
+        agents_dict = next(
+            cell.cell_contents for cell in task_tool.func.__closure__ if isinstance(cell.cell_contents, dict) and subagent_name in cell.cell_contents
+        )
+        agent = agents_dict[subagent_name]
+
+    read_tool = agent.nodes["tools"].bound._tools_by_name["read_file"]
+    fs = next(cell.cell_contents for cell in read_tool.func.__closure__ if isinstance(cell.cell_contents, FilesystemMiddleware))
+    return fs._permissions
+
+
+class TestGeneralPurposeSubagentPermissionInheritance:
+    """Regression tests: auto-added GP subagent must inherit parent permissions."""
+
+    def test_auto_added_gp_subagent_inherits_parent_permissions(self):
+        parent_perms = [
+            FilesystemPermission(operations=["write"], paths=["/secrets/**"], mode="deny"),
+        ]
+        agent = create_deep_agent(
+            model=GenericFakeChatModel(messages=iter([AIMessage(content="done")])),
+            permissions=parent_perms,
+        )
+
+        assert _filesystem_permissions_for(agent) == parent_perms
+        assert _filesystem_permissions_for(agent, "general-purpose") == parent_perms
+
+    def test_explicit_gp_subagent_permissions_override_parent(self):
+        parent_perms = [
+            FilesystemPermission(operations=["write"], paths=["/secrets/**"], mode="deny"),
+        ]
+        override_perms = [
+            FilesystemPermission(operations=["read"], paths=["/foo/**"], mode="deny"),
+        ]
+        agent = create_deep_agent(
+            model=GenericFakeChatModel(messages=iter([AIMessage(content="done")])),
+            permissions=parent_perms,
+            subagents=[{**GENERAL_PURPOSE_SUBAGENT, "permissions": override_perms}],
+        )
+
+        assert _filesystem_permissions_for(agent) == parent_perms
+        assert _filesystem_permissions_for(agent, "general-purpose") == override_perms
