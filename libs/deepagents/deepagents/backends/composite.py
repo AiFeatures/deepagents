@@ -187,7 +187,11 @@ class CompositeBackend(BackendProtocol):
 
     Examples:
         ```python
-        composite = CompositeBackend(default=StateBackend(), routes={"/memories/": StoreBackend(), "/cache/": StoreBackend()})
+        ns = lambda _rt: ("filesystem",)  # noqa: E731
+        composite = CompositeBackend(
+            default=StateBackend(),
+            routes={"/memories/": StoreBackend(namespace=ns), "/cache/": StoreBackend(namespace=ns)},
+        )
 
         composite.write("/temp.txt", "data")
         composite.write("/memories/note.txt", "data")
@@ -270,7 +274,10 @@ class CompositeBackend(BackendProtocol):
         # At root, aggregate default and all routed backends
         if path == "/":
             results: list[FileInfo] = []
-            results.extend(self.default.ls_info(path))
+            default_result = self._coerce_ls_result(self.default.ls(path))
+            if default_result.error:
+                return default_result
+            results.extend(default_result.entries or [])
             for route_prefix, _backend in self.sorted_routes:
                 # Add the route itself as a directory (e.g., /memories/)
                 results.append(
@@ -302,7 +309,10 @@ class CompositeBackend(BackendProtocol):
         # At root, aggregate default and all routed backends
         if path == "/":
             results: list[FileInfo] = []
-            results.extend(await self.default.als_info(path))
+            default_result = self._coerce_ls_result(await self.default.als(path))
+            if default_result.error:
+                return default_result
+            results.extend(default_result.entries or [])
             for route_prefix, _backend in self.sorted_routes:
                 # Add the route itself as a directory (e.g., /memories/)
                 results.append(

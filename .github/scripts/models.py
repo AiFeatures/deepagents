@@ -151,23 +151,6 @@ REGISTRY: tuple[Model, ...] = (
     ),
     # -- Baseten --
     Model(
-        "baseten:zai-org/GLM-5",
-        frozenset(
-            {
-                "eval:set0",
-                "eval:set1",
-                "eval:open",
-                "eval:baseten",
-                "harbor:set0",
-                "harbor:set1",
-                "harbor:open",
-                "harbor:baseten",
-            }
-        ),
-        "GLM-5",
-        "Baseten",
-    ),
-    Model(
         "baseten:MiniMaxAI/MiniMax-M2.5",
         frozenset(
             {
@@ -180,12 +163,6 @@ REGISTRY: tuple[Model, ...] = (
             }
         ),
         "MiniMax M2.5",
-        "Baseten",
-    ),
-    Model(
-        "baseten:moonshotai/Kimi-K2.5",
-        frozenset({"eval:set0", "eval:baseten", "harbor:set0", "harbor:baseten"}),
-        "Kimi K2.5",
         "Baseten",
     ),
     Model(
@@ -251,12 +228,6 @@ REGISTRY: tuple[Model, ...] = (
         "Fireworks",
     ),
     Model(
-        "fireworks:accounts/fireworks/models/kimi-k2p5",
-        frozenset({"eval:set0", "eval:fireworks", "harbor:set0", "harbor:fireworks"}),
-        "Kimi K2.5",
-        "Fireworks",
-    ),
-    Model(
         "fireworks:accounts/fireworks/models/kimi-k2p6",
         frozenset(
             {
@@ -267,25 +238,6 @@ REGISTRY: tuple[Model, ...] = (
             }
         ),
         "Kimi K2.6",
-        "Fireworks",
-    ),
-    Model(
-        "fireworks:accounts/fireworks/models/glm-5",
-        frozenset({"eval:set0", "eval:fireworks", "harbor:set0", "harbor:fireworks"}),
-        "GLM-5",
-        "Fireworks",
-    ),
-    Model(
-        "fireworks:accounts/fireworks/models/glm-5p1",
-        frozenset(
-            {
-                "eval:open-fireworks",
-                "eval:fireworks",
-                "harbor:open-fireworks",
-                "harbor:fireworks",
-            }
-        ),
-        "GLM-5.1",
         "Fireworks",
     ),
     Model(
@@ -331,19 +283,6 @@ REGISTRY: tuple[Model, ...] = (
             }
         ),
         "MiniMax M3",
-        "Fireworks",
-    ),
-    Model(
-        "fireworks:accounts/fireworks/models/nvidia-nemotron-3-super-120b-a12b-fp8",
-        frozenset(
-            {
-                "eval:open-fireworks",
-                "eval:fireworks",
-                "harbor:open-fireworks",
-                "harbor:fireworks",
-            }
-        ),
-        "Nemotron 3 Super 120B A12B FP8",
         "Fireworks",
     ),
     Model(
@@ -438,40 +377,7 @@ REGISTRY: tuple[Model, ...] = (
         "Kimi K2 Instruct",
         "Groq",
     ),
-    # -- NVIDIA --
-    Model(
-        "nvidia:nvidia/nemotron-3-super-120b-a12b",
-        frozenset({"eval:nvidia", "harbor:nvidia"}),
-        "Nemotron 3 Super 120B A12B",
-        "NVIDIA",
-    ),
     # -- Ollama --
-    Model(
-        "ollama:glm-5:cloud",
-        frozenset(
-            {
-                "eval:set2",
-                "eval:ollama",
-                "harbor:set2",
-                "harbor:ollama",
-            }
-        ),
-        "GLM-5 (cloud)",
-        "Ollama",
-    ),
-    Model(
-        "ollama:glm-5.1:cloud",
-        frozenset(
-            {
-                "eval:set2",
-                "eval:ollama",
-                "harbor:set2",
-                "harbor:ollama",
-            }
-        ),
-        "GLM-5.1 (cloud)",
-        "Ollama",
-    ),
     Model(
         "ollama:minimax-m2.5:cloud",
         frozenset(
@@ -511,19 +417,6 @@ REGISTRY: tuple[Model, ...] = (
             }
         ),
         "Qwen3.5 (cloud)",
-        "Ollama",
-    ),
-    Model(
-        "ollama:nemotron-3-super:cloud",
-        frozenset(
-            {
-                "eval:set2",
-                "eval:ollama",
-                "harbor:set2",
-                "harbor:ollama",
-            }
-        ),
-        "Nemotron 3 Super (cloud)",
         "Ollama",
     ),
     # -- OpenAI --
@@ -657,17 +550,6 @@ REGISTRY: tuple[Model, ...] = (
         "OpenRouter",
     ),
     Model(
-        "openrouter:moonshotai/kimi-k2.5",
-        frozenset(
-            {
-                "eval:openrouter",
-                "harbor:openrouter",
-            }
-        ),
-        "Kimi K2.5",
-        "OpenRouter",
-    ),
-    Model(
         "openrouter:moonshotai/kimi-k2.6",
         frozenset(
             {
@@ -676,21 +558,6 @@ REGISTRY: tuple[Model, ...] = (
             }
         ),
         "Kimi K2.6",
-        "OpenRouter",
-    ),
-    Model(
-        "openrouter:z-ai/glm-5.1",
-        frozenset(
-            {
-                "eval:open",
-                "eval:docs",
-                "eval:openrouter",
-                "harbor:open",
-                "harbor:docs",
-                "harbor:openrouter",
-            }
-        ),
-        "GLM-5.1",
         "OpenRouter",
     ),
     Model(
@@ -704,19 +571,6 @@ REGISTRY: tuple[Model, ...] = (
             }
         ),
         "GLM-5.2",
-        "OpenRouter",
-    ),
-    Model(
-        "openrouter:nvidia/nemotron-3-super-120b-a12b",
-        frozenset(
-            {
-                "eval:open",
-                "eval:openrouter",
-                "harbor:open",
-                "harbor:openrouter",
-            }
-        ),
-        "Nemotron 3 Super 120B A12B",
         "OpenRouter",
     ),
     Model(
@@ -983,13 +837,17 @@ def _resolve_models(workflow: str, selection: str) -> list[str]:
         Ordered list of model spec strings.
 
     Raises:
-        ValueError: If the selection is empty or contains invalid specs.
+        ValueError: If the selection is empty, resolves to no models, or contains
+            invalid specs.
     """
     env_var, presets, tag_prefix = _WORKFLOW_CONFIG[workflow]
     normalized = selection.strip()
 
     if normalized in presets:
         specs = _filter_by_tag(f"{tag_prefix}:", presets[normalized])
+        if not specs:
+            msg = f"No models resolved from {env_var} preset {normalized!r}"
+            raise ValueError(msg)
     else:
         specs = [s.strip() for s in normalized.split(",") if s.strip()]
         if not specs:
