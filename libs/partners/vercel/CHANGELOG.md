@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.0.2](https://github.com/AiFeatures/deepagents/compare/langchain-vercel-sandbox==0.0.1...langchain-vercel-sandbox==0.0.2) (2026-07-25)
+
+
+### Features
+
+* **code:** add Claude Opus 5 support ([#5049](https://github.com/AiFeatures/deepagents/issues/5049)) ([c0afec5](https://github.com/AiFeatures/deepagents/commit/c0afec5ab7e9860d1572002c1f689f95dd15cf8e))
+
 ## 0.0.1 (2026-06-13)
 
 ### Features
