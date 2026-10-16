@@ -1,5 +1,10 @@
 from pathlib import Path
+from types import SimpleNamespace
+from unittest.mock import Mock
 
+import pytest
+
+from deepagents_talon import speech
 from deepagents_talon.config import TalonConfig
 from deepagents_talon.interfaces import ChannelMessage
 from deepagents_talon.speech import (
@@ -89,7 +94,11 @@ async def test_transcribe_voice_message_transcribes_video() -> None:
     assert "transcribed" in updated.text
 
 
-async def test_transcribe_voice_message_transcribes_audio_document() -> None:
+@pytest.mark.parametrize("media_type", ["voice", "audio"])
+@pytest.mark.parametrize("text", ["", "caption"])
+async def test_transcribe_voice_message_transcribes_audio_document(
+    media_type: str, text: str
+) -> None:
     class Transcriber:
         def __init__(self) -> None:
             self.calls = 0
@@ -101,9 +110,9 @@ async def test_transcribe_voice_message_transcribes_audio_document() -> None:
     transcriber = Transcriber()
     message = ChannelMessage(
         conversation_id="chat",
-        text="",
+        text=text,
         metadata={
-            "media_type": "voice",
+            "media_type": media_type,
             "media_path": "song.mp3",
             "media_mime_types": ["audio/mpeg"],
         },
@@ -112,7 +121,8 @@ async def test_transcribe_voice_message_transcribes_audio_document() -> None:
     updated = await transcribe_voice_message(transcriber, message)
 
     assert transcriber.calls == 1
-    assert "transcribed" in updated.text
+    assert updated.text == (f"{text}\n\ntranscribed" if text else "transcribed")
+    assert updated.metadata == {**message.metadata, "voice_transcribed": True}
 
 
 async def test_transcribe_voice_message_ignores_plain_document() -> None:
@@ -135,3 +145,27 @@ async def test_transcribe_voice_message_ignores_plain_document() -> None:
 
     assert updated == message
     assert transcriber.calls == 0
+
+
+def test_local_pipeline_uses_talon_home_cache(tmp_path: Path, monkeypatch) -> None:
+    config = TalonConfig.from_env({"DEEPAGENTS_TALON_HOME": str(tmp_path)})
+    download = Mock(return_value=str(tmp_path / "snapshot"))
+    pipeline = Mock()
+    modules = {
+        "huggingface_hub": SimpleNamespace(snapshot_download=download),
+        "transformers": SimpleNamespace(pipeline=pipeline, AutoModel=Mock(), AutoProcessor=Mock()),
+    }
+    monkeypatch.setattr(speech.importlib, "import_module", modules.__getitem__)
+    monkeypatch.setattr(speech, "_local_pipelines", {})
+
+    speech._load_local_pipeline(DEFAULT_LOCAL_VOICE_TRANSCRIPTION_MODEL, "cpu", config)
+
+    download.assert_called_once_with(
+        repo_id=DEFAULT_LOCAL_VOICE_TRANSCRIPTION_MODEL,
+        cache_dir=str(tmp_path / "cache" / "models" / "huggingface"),
+        token=False,
+    )
+    for loader in (modules["transformers"].AutoModel, modules["transformers"].AutoProcessor):
+        loader.from_pretrained.assert_called_once_with(
+            download.return_value, local_files_only=True, trust_remote_code=False
+        )

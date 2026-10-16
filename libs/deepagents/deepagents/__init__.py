@@ -26,6 +26,8 @@ from deepagents.profiles.provider.provider_profiles import (
 )
 
 __all__ = [
+    "AsyncSubAgent",
+    "AsyncSubAgentMiddleware",
     "CompiledSubAgent",
     "DeepAgentState",
     "FilesystemMiddleware",

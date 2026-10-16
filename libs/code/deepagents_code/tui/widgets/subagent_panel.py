@@ -85,6 +85,9 @@ class _SubagentRecord:
     duration_ms: int | None = None
     """Measured duration once finished; None while still running."""
 
+    replayed: bool = False
+    """Whether timing must span multiple attempts, including approval waits."""
+
     error: str | None = None
     """Failure reason, set only when status is error."""
 
@@ -249,6 +252,19 @@ class SubagentPanel(Vertical):
         text-style: bold;
     }
 
+    SubagentPanel #subagent-header-summary {
+        width: 1fr;
+        height: 1;
+        text-wrap: nowrap;
+        text-overflow: ellipsis;
+    }
+
+    SubagentPanel #subagent-header-hint {
+        width: auto;
+        height: 1;
+        margin-left: 2;
+    }
+
     SubagentPanel #subagent-body {
         width: 1fr;
         height: auto;
@@ -291,14 +307,12 @@ class SubagentPanel(Vertical):
         self._last_render: dict[str, str] = {}
         self._spinner = Spinner()
         self._timer: Timer | None = None
-        # When True, the next subagent `start` clears the previous workflow's
-        # fan-out before adding the new row (armed by `prepare_turn`). Lets the
-        # panel persist across turns until a new workflow actually begins.
-        self._pending_reset = False
 
     def compose(self) -> ComposeResult:  # noqa: PLR6301 — Textual widget method
         """Yield the header line and the two-pane body (phases | agents)."""
-        yield Static("", id="subagent-header", markup=False)
+        with Horizontal(id="subagent-header"):
+            yield Static("", id="subagent-header-summary", markup=False)
+            yield Static("", id="subagent-header-hint", markup=False)
         with Horizontal(id="subagent-body"):
             with VerticalScroll(id="subagent-phases-scroll"):
                 yield Static("", id="subagent-phases", markup=False)
@@ -356,17 +370,19 @@ class SubagentPanel(Vertical):
         self._refresh()
 
     def _handle_start(self, sub_id: str, eval_key: str, event: dict[str, Any]) -> None:
-        """Create/replace a running record and (re-)show the panel."""
-        if self._pending_reset:
-            # A new workflow is starting — drop the previous turn's fan-out now.
-            self._clear()
+        """Create a running record without resetting replayed dispatches."""
         phase = self._ensure_phase(eval_key)
         self._active_eval_id = eval_key
+        if record := phase.records.get(sub_id):
+            record.replayed = True
+            return
 
         record = _SubagentRecord(
             id=sub_id,
             label=_sanitize(self._row_label(event), max_chars=200),
         )
+        if not self._any_running():
+            self.expanded = True
         phase.add(record)
         self._show()
         self._apply_body_height()
@@ -426,9 +442,13 @@ class SubagentPanel(Vertical):
             # dropped on the wire) carries the failure string — synthesize a
             # minimal record so it still surfaces instead of vanishing silently.
             record = self._adopt_orphan_finish(sub_id, eval_key, event)
+        if record.status != "running":
+            return
         record.status = "done" if outcome == "complete" else "error"
         duration = event.get("duration_ms")
-        if isinstance(duration, (int, float)):
+        if record.replayed or not isinstance(duration, (int, float)):
+            record.duration_ms = int(record.elapsed_seconds() * 1000)
+        else:
             record.duration_ms = int(duration)
         if outcome == "error":
             raw_err = event.get("error")
@@ -437,6 +457,7 @@ class SubagentPanel(Vertical):
             )
         if not self._any_running():
             self._stop_timer()
+            self.expanded = False
 
     def _adopt_orphan_finish(
         self, sub_id: str, eval_key: str, event: dict[str, Any]
@@ -449,10 +470,6 @@ class SubagentPanel(Vertical):
         Returns:
             The newly created record, already inserted into its phase.
         """
-        if self._pending_reset:
-            # A dropped-start error is still evidence that a new workflow
-            # started, so clear the previous turn before surfacing it.
-            self._clear()
         phase = self._ensure_phase(eval_key)
         self._active_eval_id = eval_key
         record = _SubagentRecord(
@@ -505,7 +522,7 @@ class SubagentPanel(Vertical):
             True if the click offset maps onto the header widget.
         """
         try:
-            header = self.query_one("#subagent-header", Static)
+            header = self.query_one("#subagent-header", Horizontal)
         except (NoMatches, TooManyMatches):  # not mounted yet
             return False
         return event.get_content_offset(header) is not None
@@ -554,25 +571,11 @@ class SubagentPanel(Vertical):
         self._refresh()
 
     def prepare_turn(self, *, model_label: str | None = None) -> None:
-        """Arm a deferred clear for a new turn without touching the panel yet.
-
-        The visible fan-out persists across turns; it is cleared lazily when the
-        next workflow actually starts a subagent (see `_handle_start`), so a turn
-        that spawns none leaves the previous results on screen. Refreshes the
-        session model used to label rows.
-        """
+        """Clear the previous workflow's fan-out for a new turn."""
         self._model_label = (
             _sanitize(model_label, max_chars=_MODEL_COL) if model_label else None
         )
-        # If the previous turn left rows stuck "running" — e.g. it was cancelled
-        # before the bridge emitted terminal events (CancelledError is a
-        # BaseException, so it bypasses the bridge's `except Exception`) — clear
-        # now instead of persisting a stale, still-spinning fan-out. Otherwise
-        # defer the clear so a completed workflow survives no-subagent turns.
-        if self._any_running():
-            self._clear()
-        else:
-            self._pending_reset = True
+        self._clear()
 
     def reset(self, *, model_label: str | None = None, **_kwargs: Any) -> None:
         """Clear all phases and hide the panel immediately (e.g. on `/clear`)."""
@@ -593,7 +596,6 @@ class SubagentPanel(Vertical):
         self._selected_eval_id = None
         self._applied_height = None
         self._last_render.clear()
-        self._pending_reset = False
         self._stop_timer()
         self.remove_class("-visible")
 
@@ -616,6 +618,7 @@ class SubagentPanel(Vertical):
         if not changed:
             return
         self._stop_timer()
+        self.expanded = False
         self._refresh()
 
     def _show(self) -> None:
@@ -623,7 +626,7 @@ class SubagentPanel(Vertical):
         self.add_class("-visible")
 
     def toggle(self) -> None:
-        """Toggle the body open/closed. This is the only thing that changes it."""
+        """Toggle the body open or closed for manual inspection."""
         self.expanded = not self.expanded
 
     def watch_expanded(self, expanded: bool) -> None:
@@ -733,7 +736,13 @@ class SubagentPanel(Vertical):
         self._refresh_agents()
 
     def _refresh_header(self) -> None:
-        """Render the header: status icon, label, whole-turn totals, toggle hint."""
+        """Render the header: status icon, label, whole-turn totals, toggle hint.
+
+        The summary and hint are separate widgets so that layout, rather than
+        manual padding, decides what gives when the panel is narrow: the hint
+        keeps its natural width and the `1fr` summary ellipsizes. Merging them
+        back into one `Static` would truncate the hint instead.
+        """
         colors = get_theme_colors(self)
         glyphs = get_glyphs()
         caret = (
@@ -750,20 +759,17 @@ class SubagentPanel(Vertical):
             icon, tint = glyphs.checkmark, colors.success
         lead_text = f"{caret} {icon}  dynamic subagents"
         parts: list[Content] = [Content.styled(lead_text, tint)]
-        left_len = len(lead_text)
-
-        if self.expanded and total:
-            meta = self._header_meta_parts(done, total, failed, cancelled, colors)
-            parts.extend(meta)
-            left_len += sum(len(p.plain) for p in meta)
+        if total:
+            parts.extend(
+                self._header_meta_parts(done, total, failed, cancelled, colors)
+            )
+        self._update_cached("subagent-header-summary", Content.assemble(*parts))
         hint = (
-            "click or Ctrl+G to collapse"
+            "click or Ctrl+T to collapse"
             if self.expanded
-            else "click or Ctrl+G to expand"
+            else "click or Ctrl+T to expand"
         )
-        spacer = max(2, self._header_width() - left_len - len(hint))
-        parts.append(Content.styled(" " * spacer + hint, colors.muted))
-        self._update_cached("subagent-header", Content.assemble(*parts))
+        self._update_cached("subagent-header-hint", Content.styled(hint, colors.muted))
 
     def _header_meta_parts(
         self,
@@ -773,34 +779,27 @@ class SubagentPanel(Vertical):
         cancelled: int,
         colors: Any,  # noqa: ANN401 — ThemeColors
     ) -> list[Content]:
-        """Whole-turn totals (phase count, failures, cancellations) when expanded.
+        """Whole-turn totals (phase count, failures, cancellations).
 
         Returns:
             The styled `Content` pieces appended after the header label.
         """
+        separator = get_glyphs().separator
         meta_text = f"   {done}/{total} done"
         count = len(self._phase_order)
         if count:
             plural = "phase" if count == 1 else "phases"
-            meta_text += f"  ·  {count} {plural}"
+            meta_text += f"  {separator}  {count} {plural}"
         parts: list[Content] = [Content.styled(meta_text, colors.muted)]
         if failed:
-            parts.append(Content.styled(f"  ·  {failed} failed", colors.error))
+            parts.append(
+                Content.styled(f"  {separator}  {failed} failed", colors.error)
+            )
         if cancelled:
-            parts.append(Content.styled(f"  ·  {cancelled} cancelled", colors.muted))
+            parts.append(
+                Content.styled(f"  {separator}  {cancelled} cancelled", colors.muted)
+            )
         return parts
-
-    def _header_width(self) -> int:
-        """Current cell width of the header line (fallback until laid out).
-
-        Returns:
-            The header width, or a fallback before first layout.
-        """
-        try:
-            width = self.query_one("#subagent-header", Static).size.width
-        except (NoMatches, TooManyMatches):  # not mounted yet
-            width = 0
-        return width if width and width > 0 else _FALLBACK_WIDTH
 
     def _refresh_phases(self) -> None:
         """Render the left pane: one selectable row per phase (eval batch)."""
@@ -856,7 +855,8 @@ class SubagentPanel(Vertical):
         tint = colors.primary if selected else colors.muted
         elapsed = _format_timing(phase.elapsed_seconds())
         return Content.styled(
-            f"{caret} {mark} {phase.index} {done}/{total} · {elapsed}", tint
+            f"{caret} {mark} {phase.index} {done}/{total} {glyphs.separator} {elapsed}",
+            tint,
         )
 
     def _agents_width(self) -> int:

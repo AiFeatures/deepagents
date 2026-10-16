@@ -74,20 +74,61 @@ class PersistentCronScheduler:
         self._task = None
 
     async def tick_once(self) -> None:
-        """Run all jobs due at the current clock value once."""
+        """Remove finished jobs, then run all jobs due at the current clock value once.
+
+        The sweep runs first and due jobs run one after another inside the
+        tick, so it never removes a job that is mid-run.
+        """
         current = self.now()
+        self._discard_finished(current)
         jobs = self.store.due_jobs(now=current)
         log_event(logger, "cron.tick", due_count=len(jobs), now=current.isoformat())
         for job in jobs:
             await self._run_due_job(job, current)
 
     async def _ticker(self) -> None:
+        """Scan for due jobs until stopped, surviving a failed scan.
+
+        A tick reads the store, consults the clock, and dispatches; an
+        unexpected raise from any of those would otherwise leave the task
+        completed-with-exception, and since nothing awaits it but `stop`, the
+        scheduler would go quiet for the life of the process with no more than
+        an "exception was never retrieved" warning at collection time. Logging
+        and continuing costs one missed scan instead: due jobs stay due, so the
+        next tick picks them up.
+
+        `Exception` rather than `BaseException` is deliberate --
+        `asyncio.CancelledError` derives from the latter, so cancellation still
+        propagates and `stop` keeps working.
+        """
         while not self._stopped.is_set():
-            await self.tick_once()
+            try:
+                await self.tick_once()
+            except Exception as exc:
+                logger.exception("Cron tick failed")
+                # `log_event` JSON-encodes and redacts its fields, so untrusted
+                # text off the store cannot forge a log line.
+                log_event(logger, "cron.tick_failure", error=str(exc))
+            # The wait happens even after a failure, so a persistently broken
+            # tick retries on the normal interval instead of spinning.
             try:
                 await asyncio.wait_for(self._stopped.wait(), timeout=self.tick_seconds)
             except TimeoutError:
                 continue
+
+    def _discard_finished(self, now: datetime) -> None:
+        # One event with the facts rather than a completed/expired split: a job
+        # can finish its last run and pass `until` in the same tick, and
+        # `last_run_at` already says whether it ever ran.
+        for job in self.store.discard_finished(now=now):
+            log_event(
+                logger,
+                "cron.job_removed",
+                job_id=job.id,
+                job_name=job.name,
+                last_run_at=None if job.last_run_at is None else job.last_run_at.isoformat(),
+                until=None if job.until is None else job.until.isoformat(),
+            )
 
     async def _run_due_job(self, job: CronJob, now: datetime) -> None:
         claimed = self.store.advance_next_run(job.id, now=now)
@@ -127,10 +168,10 @@ class PersistentCronScheduler:
             "cron.success",
             job_id=claimed.id,
             job_name=claimed.name,
-            silent=_is_silent(text),
-            has_delivery=bool(text and not _is_silent(text)),
+            silent=is_silent(text),
+            has_delivery=bool(text and not is_silent(text)),
         )
-        if _is_silent(text):
+        if is_silent(text):
             log_event(
                 logger,
                 "cron.delivery_suppressed",
@@ -166,5 +207,14 @@ class PersistentCronScheduler:
             )
 
 
-def _is_silent(text: str) -> bool:
-    return text.strip().startswith(SILENT_SENTINEL)
+def is_silent(text: str) -> bool:
+    """Whether a scheduled result asks to be withheld from the chat.
+
+    Args:
+        text: Agent output produced for a scheduled job.
+
+    Returns:
+        Whether the text carries the silent sentinel at either end.
+    """
+    stripped = text.strip()
+    return stripped.startswith(SILENT_SENTINEL) or stripped.endswith(SILENT_SENTINEL)

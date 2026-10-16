@@ -1,0 +1,60 @@
+{
+  "schemaVersion": 1,
+  "pageVersion": "sha256:9bfa366ba397b4b7e44519e519c4c8983c6984d9ef48e2691d2ee4a487636d18",
+  "claims": [
+    {
+      "id": "claim_ca81ddc0509f4e11a1d572e37ab6aaea",
+      "statement": "`DeepAgentRuntime` owns Deep Agents graph construction: it combines filesystem middleware, built-in clock and progress tools, configured runtime tools, optional archive and cron tools, approval tools, subagents, and optional web/help capabilities before the host invokes it through `AgentRequest`.",
+      "evidence": [
+        {
+          "resource": "repo://libs/talon/deepagents_talon/__main__.py#L374-L394",
+          "version": "repo-lines-v1:sha256:be624e9d4123fcbac4c17739e1e2d3047892b8e7c5e81b6ef55c8d86853b3d29:eyJzZWxlY3RlZExpbmVDb3VudCI6MjEsImZpcnN0U2VsZWN0ZWRMaW5lSGFzaCI6IjcyYmU1ODNkZTJjODVlMDdkNWRlZTIxMTVmMjI3NWU0MjUyMDg2Njg4OTQ0MzZmNGNmMTI0NDQ4YWQ0MmVmY2IiLCJsYXN0U2VsZWN0ZWRMaW5lSGFzaCI6IjMwYzFmMTg4ZjE0MmVkN2E4MjQ2ODBiMjA3MTcyYzU1MTliYzYxNGE0OGZkYTdjZjE2N2VkYjhkZGY3OTk1NmMiLCJwcmVjZWRpbmdDb250ZXh0TGluZUNvdW50IjozLCJwcmVjZWRpbmdDb250ZXh0SGFzaCI6IjgzOGIyNWJjZGZhNjRkYmY2YTZjODkxOTk4MDg5ODZkMWNiOThlODg2MGVjYjgyOTUzYWU4MjEwZTIzNjY1MTMiLCJmb2xsb3dpbmdDb250ZXh0TGluZUNvdW50IjozLCJmb2xsb3dpbmdDb250ZXh0SGFzaCI6IjQ0NWRjY2NiN2JmYmEwYTZjNzI0MjNlYTE2NjdiMjMwNTBjNzY5MzM1MmEzOTU1YjZhNmNhYWRmMTVkZTA3NmUifQ"
+        },
+        {
+          "resource": "repo://libs/talon/deepagents_talon/runtime.py#L417-L540",
+          "version": "repo-lines-v1:sha256:7900489224423adc47c5e9f30b90563da60efd43a86f32684c041c3ba72c244b:eyJzZWxlY3RlZExpbmVDb3VudCI6MTI0LCJmaXJzdFNlbGVjdGVkTGluZUhhc2giOiJhYzZkZmJiNzZjNWZjYzRiY2QzNzI1ODk1MzU4Y2U4YmNlYWI1Y2I1ZWIxMjYzMDc2ZWM5Y2FhMTY3ZWVjMDM0IiwibGFzdFNlbGVjdGVkTGluZUhhc2giOiI2ODQ0ZDU0NzdjODA3OWU5OGQ4YjYwY2Y0NzYzYjUzZTYwMjNlZTlhMzRkNmU1ZDA4Mzg2YTFlNDcyNTFlYzkxIiwicHJlY2VkaW5nQ29udGV4dExpbmVDb3VudCI6MywicHJlY2VkaW5nQ29udGV4dEhhc2giOiI4MTliOGExMzBhMjQ2NWIxY2Y4NjIzZDNkNDY1MzgyMjIwOTJjZGMyZjA2M2U3YzJhNjlhYjc1MzdhMzYxNGJjIiwiZm9sbG93aW5nQ29udGV4dExpbmVDb3VudCI6MywiZm9sbG93aW5nQ29udGV4dEhhc2giOiJlZWI0MDlhYzk1YTMxYjlkZWQxZjY3MGZlNjI4ZDJkNDk5OWRlZWU5MTE1NGM1NTg1MTAzMmNjNTkzZDc1NGViIn0"
+        },
+        {
+          "resource": "repo://libs/talon/deepagents_talon/runtime.py#L944-L960",
+          "version": "repo-lines-v1:sha256:7d28bd2d0993fea3b49550e7c491d617b248e847e27e015ce99371fa848277ef:eyJzZWxlY3RlZExpbmVDb3VudCI6MTcsImZpcnN0U2VsZWN0ZWRMaW5lSGFzaCI6ImQ0NThhZjA3N2IzMzQ3YzJiMjcwZjIzODExZjNmOWQwMGRhODE4ZWJhZTI5NzcwMWFlZmQ1NWRjMTY1ZmViZjgiLCJsYXN0U2VsZWN0ZWRMaW5lSGFzaCI6IjBmMTM3NGE1ZjI1M2FmN2Y1NjQzZWEyNTk1YzE2ZTYzOGIxMmIyMzUyMTczNDM2ZDkwZWU1ZDA4ZjE0YmI3Y2MiLCJwcmVjZWRpbmdDb250ZXh0TGluZUNvdW50IjozLCJwcmVjZWRpbmdDb250ZXh0SGFzaCI6ImMxMzJjOTczNTZjOWViMDU0MmJjYjkxMjMyMWYwY2NiMzUzYWEzNmY5MTlmMzEyZjk4MDY4MWNlZTVlMDM1NWYiLCJmb2xsb3dpbmdDb250ZXh0TGluZUNvdW50IjozLCJmb2xsb3dpbmdDb250ZXh0SGFzaCI6Ijk0Yjg3YzA0NTg4NWNkNzQ0Mzc3ZTZmMWU3NWZiN2RiMTU2M2E2ZTE1OWE2ZTQ4MjYzYTk0Y2YzNTYzZTYyODAifQ"
+        }
+      ]
+    },
+    {
+      "id": "claim_b0d5c16e06b74687bb70be5666a5eb12",
+      "statement": "For each interactive turn, the host supplies request-scoped delivery, tool-approval, and authorization handlers plus trusted metadata; the runtime binds invocation graph, model, approval, history, cron, authorization, and message state in context variables and resets them after invocation.",
+      "evidence": [
+        {
+          "resource": "repo://libs/talon/deepagents_talon/host.py#L1267-L1311",
+          "version": "repo-lines-v1:sha256:ccb69c7722f31b57d47aedee41147f33305ed033262eb85b9045071f54cfacfe:eyJzZWxlY3RlZExpbmVDb3VudCI6NDUsImZpcnN0U2VsZWN0ZWRMaW5lSGFzaCI6ImQ1YzM0ZWJiZDAzYTlhMTViM2MxOTUzNDk1MWI0ZmQ4YTA1MDRiZDY0OWY4ZDE5YzYyZWUxZWFkYzMwMzBmM2IiLCJsYXN0U2VsZWN0ZWRMaW5lSGFzaCI6ImIyOWM1MjQ0MzRjMDA5YWFmMGQ3ZmU5ZTJmZmU3MjJiMTcwY2Y4ZWIxYzhjMTU3NWU0ZTNiZDUxZTkyNmM3MWIiLCJwcmVjZWRpbmdDb250ZXh0TGluZUNvdW50IjozLCJwcmVjZWRpbmdDb250ZXh0SGFzaCI6Ijc5NDhmOTIyMzRlNzI2N2I3NjczNzZiMGM2ZTZhMGVkYTUzZjUyM2Q2YWQ5M2E4NjRkM2FhNzMxYTMxZWVmNzYiLCJmb2xsb3dpbmdDb250ZXh0TGluZUNvdW50IjozLCJmb2xsb3dpbmdDb250ZXh0SGFzaCI6ImJmOTQyYTgzNGJiNDA3YTBhMzFjOTUyODdkOWUyYWIzMjZhMTAxMWVhNjE4MWZkYzE4MzdlOGZlYjZhNDk2NjgifQ"
+        },
+        {
+          "resource": "repo://libs/talon/deepagents_talon/host.py#L964-L1056",
+          "version": "repo-lines-v1:sha256:19b8febd696dffd128a55e8ac83fca0edb890e49d809faa89bfd929626938348:eyJzZWxlY3RlZExpbmVDb3VudCI6OTMsImZpcnN0U2VsZWN0ZWRMaW5lSGFzaCI6IjkxMTRhNzAzODI4M2ExZmIwNGQxOTFlY2ZhMjIwMGJiY2QyMjk0OTUxYzlkN2RiMGQ1OGZkM2NhNDNhYjMzNDkiLCJsYXN0U2VsZWN0ZWRMaW5lSGFzaCI6IjU1MDMyZTk2NGQwOTMyMzUxZTVkMTg1MjY5MjgxYjE3MWEzYTA5YjA4YjI4NmU2NjFlYTQ3MDMyM2M4MmViNGQiLCJwcmVjZWRpbmdDb250ZXh0TGluZUNvdW50IjozLCJwcmVjZWRpbmdDb250ZXh0SGFzaCI6IjRmY2Q2YzEyM2MyNjQ2M2RjZGU2ZThjZDE0NTU4YjU0NjZiY2U4MmZkYWNkN2Y1MDgxZmVhOTJhYWNmZjU1ZWQiLCJmb2xsb3dpbmdDb250ZXh0TGluZUNvdW50IjozLCJmb2xsb3dpbmdDb250ZXh0SGFzaCI6IjZjYzFlMmYxNTgyZDljYWQ2NDQwZTdlYmZkNmFjNTczMjQwNzlhZGY0MDJhOGI1YjI1ODVlY2VhYzQ0N2U1ZGQifQ"
+        },
+        {
+          "resource": "repo://libs/talon/deepagents_talon/runtime.py#L686-L742",
+          "version": "repo-lines-v1:sha256:cf15a1177f794eee6c97e0960ba5809ef91ad98ee14d9ab9ab526e102539260d:eyJzZWxlY3RlZExpbmVDb3VudCI6NTcsImZpcnN0U2VsZWN0ZWRMaW5lSGFzaCI6ImNiZTI3ZjIzNWM1MzliN2Q5MGViNDUxMDhlODU3OTU1Y2NlZWZkOTI4MjFmNDdmMjJkYjVhMjc5Nzc1YzI2MzMiLCJsYXN0U2VsZWN0ZWRMaW5lSGFzaCI6ImE1NzIyZjc4ODE3ZTNjYzRiY2EwMjNkOWEyOTZlZjMxZDRhMWQ1ZjE5ZGJjMWE3YzhkYThhNGU0NjI2NjBhZTkiLCJwcmVjZWRpbmdDb250ZXh0TGluZUNvdW50IjozLCJwcmVjZWRpbmdDb250ZXh0SGFzaCI6ImFiYWNkMzkxMTBlMmY0MTM1MTc3NDUzZTFlNjY5YTM3Y2FiOGVhMWRhOTQzNTlhNDg5MmZkOGEwYjNjYWU4N2MiLCJmb2xsb3dpbmdDb250ZXh0TGluZUNvdW50IjozLCJmb2xsb3dpbmdDb250ZXh0SGFzaCI6ImM4MmY4ZGE3ZmRkMzQwYTg3ZjQxMDdjZmFmM2UyNmU0NjA1OWIwMDI0ZDU3MjYzZGE1ZmQyODYwMWNhN2UxYjEifQ"
+        }
+      ]
+    },
+    {
+      "id": "claim_f869e13a362744d69ea0c09429fa5ae3",
+      "statement": "The persistent scheduler scans due jobs one at a time, records run or delivery failures in the job store, suppresses `[SILENT]` output, and logs a failed scan before retrying on its normal interval rather than terminating its ticker.",
+      "evidence": [
+        {
+          "resource": "repo://libs/talon/deepagents_talon/cron/scheduler.py#L133-L207",
+          "version": "repo-lines-v1:sha256:089dd931b6422647e0004fa659d807cdc11aa74b6b78df300c41fe4860f229c4:eyJzZWxlY3RlZExpbmVDb3VudCI6NzUsImZpcnN0U2VsZWN0ZWRMaW5lSGFzaCI6ImJmM2I4MzBmYjJjZmIyOTQ3MDAyZmVkMmUxMTNjNWM2MmQyZmIzZWYzM2JkMWJmODIwMDE2NDNiZmEzNjNiNDIiLCJsYXN0U2VsZWN0ZWRMaW5lSGFzaCI6IjU1MDMyZTk2NGQwOTMyMzUxZTVkMTg1MjY5MjgxYjE3MWEzYTA5YjA4YjI4NmU2NjFlYTQ3MDMyM2M4MmViNGQiLCJwcmVjZWRpbmdDb250ZXh0TGluZUNvdW50IjozLCJwcmVjZWRpbmdDb250ZXh0SGFzaCI6IjcxY2E3YmI4NTQxOWZmMGNjYTc2YjYzNTgwMjEwNDQ4MmNhMThkNjVkNzA0ODNlNjkwNDQyNzQwYWY0OTg2MjkiLCJmb2xsb3dpbmdDb250ZXh0TGluZUNvdW50IjozLCJmb2xsb3dpbmdDb250ZXh0SGFzaCI6ImJlZDg0NmZkYzZmY2VlYzMxMGVmOGE2MzQwNGE4N2RjOGU1Yjc0OWM2MTQ3NDEzNTU4MWUzNzNkODg3YzhkZGEifQ"
+        },
+        {
+          "resource": "repo://libs/talon/deepagents_talon/cron/scheduler.py#L76-L117",
+          "version": "repo-lines-v1:sha256:c37db3809d2d2d92875d0ed84bd55ccf6fb46bc5e8be4532e13dea6ebcbca555:eyJzZWxlY3RlZExpbmVDb3VudCI6NDIsImZpcnN0U2VsZWN0ZWRMaW5lSGFzaCI6IjdkNWJlMjdiN2Q5OTVmZjhkYThmZjQzMGYxNDQxYmJiNjE4YjRlOGIzMzk2MzMxY2JlNjhmOTEzZWQwNWUyMmQiLCJsYXN0U2VsZWN0ZWRMaW5lSGFzaCI6IjlkOGE5ZTljMzI1MjgyMGM2NWE4MTY1MjBiOGRiNDkzMjI4MDg0OWVjOGM3ZDJlYjYyNzJhZmRmZWJlMDU5YzMiLCJwcmVjZWRpbmdDb250ZXh0TGluZUNvdW50IjozLCJwcmVjZWRpbmdDb250ZXh0SGFzaCI6IjgyOWY3MmZmMjAzZTc3YzI0MDc2NzQ0NjBmZGQxMzhjMjVkMGU0NDNjZjRjNDMzNTVhZTIxMDNmNjZkZTkwMDYiLCJmb2xsb3dpbmdDb250ZXh0TGluZUNvdW50IjozLCJmb2xsb3dpbmdDb250ZXh0SGFzaCI6IjEwYTI2YTBiZjllODA1ZWVlNTUxZjVlNGY1OTljZWNjYTA0OWFjNDE2ZjFhNTUyYTczZTIzOWJkMzRjOTdlZmIifQ"
+        }
+      ]
+    }
+  ],
+  "verification": {
+    "by": "openwiki/0.4.2",
+    "at": "2026-10-14T08:05:41.101Z"
+  }
+}

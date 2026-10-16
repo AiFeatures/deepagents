@@ -1,3 +1,8 @@
 # Files
 
-- [Deep Agents runtime and package architecture](overview.md) - How the core SDK composes LangChain and LangGraph, and how the terminal agent, deployment CLI, ACP adapter, and integrations attach to that runtime.
+- [Deep Agents Code Architecture](code-agent.md) - dcode 0.1.85 separates its terminal client from a LangGraph agent server, with durable goal context, server-enforced skills, and defensive approval-mode interaction at the UI boundary.
+- [Middleware Assembly Stack](middleware-stack.md) - Exact middleware assembly, replacement, exclusion, approval, and tool-visibility order for Deep Agents main agents and each subagent form. Covers HarnessProfile policy, filesystem permission interrupts, and the boundaries between declarative, compiled, and remote subagents.
+- [Repository Architecture Overview](overview.md) - Architecture and release map for the Deep Agents Python monorepo, covering the SDK, dcode, ACP, evaluations, Talon, and partner integrations. Explains current package dependencies, graph assembly and delegation boundaries, persistence, and host lifecycle ownership.
+- [Runtime Behavior, State, and Delegation](runtime-behavior.md) - Runtime contracts for Deep Agents graph construction, path-sensitive filesystem approval, checkpointed state, binary blob hydration, and synchronous and remote delegation. Explains the ownership boundaries that must survive graph and middleware changes.
+- [SDK Construction and Execution](sdk-construction-execution.md) - How create_deep_agent assembles a Deep Agents graph, routes synchronous and remote subagents, preserves state boundaries, and derives filesystem approvals.
+- [Source Map and Ownership Boundaries](source-map.md) - Practical change-routing map for Deep Agents graph assembly, synchronous and asynchronous delegation, and conversation summarization. Distinguishes reusable SDK seams from Talon's runtime-specific integration.

@@ -39,13 +39,15 @@ from deepagents._excluded_middleware import (
 from deepagents._messages_reducer import _messages_delta_reducer
 from deepagents._models import resolve_model
 from deepagents._tools import _apply_tool_description_overrides
-from deepagents._version import __version__
+from deepagents._version import _lc_version
 from deepagents.backends import StateBackend
 from deepagents.backends.protocol import BackendProtocol
 from deepagents.middleware._fs_interrupt import _build_interrupt_on_from_permissions
+from deepagents.middleware._parent_notifier import _ParentNotifierMiddleware
 from deepagents.middleware._prompt_caching import append_prompt_caching_middleware
 from deepagents.middleware._state import private_state_field_names
 from deepagents.middleware._tool_exclusion import _ToolExclusionMiddleware
+from deepagents.middleware._utils import append_to_system_message
 from deepagents.middleware.async_subagents import AsyncSubAgent, AsyncSubAgentMiddleware
 from deepagents.middleware.filesystem import FilesystemMiddleware, FilesystemPermission
 from deepagents.middleware.memory import MemoryMiddleware
@@ -56,8 +58,11 @@ from deepagents.middleware.subagents import (
     CompiledSubAgent,
     SubAgent,
     SubAgentMiddleware,
+    _is_compiled_subagent,
+    _is_forked_subagent,
 )
 from deepagents.middleware.summarization import create_summarization_middleware
+from deepagents.middleware.unsupported_content import UnsupportedContentMiddleware
 from deepagents.profiles.harness.harness_profiles import (
     GeneralPurposeSubagentProfile,
     _apply_profile_prompt,
@@ -198,6 +203,11 @@ def _merge_fs_interrupt_on(
     return merged
 
 
+def _passed_skills_sources(middleware: Sequence[AgentMiddleware[Any, Any, Any]]) -> list[str] | None:
+    """Sources of a `SkillsMiddleware` passed to take the skills slot by name, if any."""
+    return next((m.sources for m in middleware if isinstance(m, SkillsMiddleware) and m.name == "SkillsMiddleware"), None)
+
+
 def _apply_custom_middleware(
     base: list[AgentMiddleware[Any, Any, Any]],
     custom: Sequence[AgentMiddleware[Any, Any, Any]],
@@ -334,9 +344,11 @@ def create_deep_agent(  # noqa: C901, PLR0912, PLR0915  # Complex graph assembly
             (filesystem tools, `execute`, and `task`).
 
             Passing tools here is additive — it never removes a built-in.
-            To drop a built-in tool, register a
+            To stop offering a built-in tool to the model, register a
             [`HarnessProfile`][deepagents.HarnessProfile] with
-            `excluded_tools`.
+            `excluded_tools`. To remove one entirely, pass your own
+            [`FilesystemMiddleware`][deepagents.middleware.filesystem.FilesystemMiddleware]
+            with `tools=[...]`.
         system_prompt: Caller-authored system instructions (`USER`) placed
             first in the system prompt sent to the model.
 
@@ -363,7 +375,6 @@ def create_deep_agent(  # noqa: C901, PLR0912, PLR0915  # Complex graph assembly
 
             Base stack:
 
-            - [`SkillsMiddleware`][deepagents.middleware.skills.SkillsMiddleware] (if `skills` is provided)
             - [`FilesystemMiddleware`][deepagents.middleware.filesystem.FilesystemMiddleware]
             - [`SubAgentMiddleware`][deepagents.middleware.subagents.SubAgentMiddleware]
                 (if any inline subagents — declarative
@@ -379,7 +390,7 @@ def create_deep_agent(  # noqa: C901, PLR0912, PLR0915  # Complex graph assembly
             Tail stack:
 
             - Harness profile `extra_middleware` (if any)
-            - `_ToolExclusionMiddleware` (if profile has `excluded_tools`)
+            - [`SkillsMiddleware`][deepagents.middleware.skills.SkillsMiddleware] (if `skills` is provided)
             - [`AnthropicPromptCachingMiddleware`][langchain_anthropic.middleware.AnthropicPromptCachingMiddleware] (unconditional; no-ops for
                 non-Anthropic models)
             - [`BedrockPromptCachingMiddleware`](https://reference.langchain.com/python/langchain-aws/middleware/prompt_caching/BedrockPromptCachingMiddleware)
@@ -388,6 +399,17 @@ def create_deep_agent(  # noqa: C901, PLR0912, PLR0915  # Complex graph assembly
                 when `langchain-fireworks` is installed (no-ops for non-Fireworks models)
             - [`MemoryMiddleware`][deepagents.middleware.memory.MemoryMiddleware] (if `memory` is provided)
             - [`HumanInTheLoopMiddleware`][langchain.agents.middleware.HumanInTheLoopMiddleware] (if `interrupt_on` is provided)
+            - [`UnsupportedContentMiddleware`][deepagents.middleware.unsupported_content.UnsupportedContentMiddleware]
+            - `_ToolExclusionMiddleware` (if profile has `excluded_tools`)
+
+            `SkillsMiddleware` sits after user and profile middleware so that
+            skill tool disclosure sees the compacted conversation and the
+            model actually called, after any fallback or routing middleware.
+            Middleware passed here therefore runs before it: it doesn't see
+            freshly loaded `skills_metadata` in `before_agent` /
+            `before_model`, and can't edit the skills section of the system
+            prompt in `wrap_model_call`. Passing a middleware whose `name` is
+            `"SkillsMiddleware"` still replaces it in place.
 
             After assembly, any entries in the profile's
             `excluded_middleware` are filtered from the final stack. Class
@@ -413,10 +435,15 @@ def create_deep_agent(  # noqa: C901, PLR0912, PLR0915  # Complex graph assembly
             - [`AsyncSubAgent`][deepagents.middleware.async_subagents.AsyncSubAgent]: A remote/background subagent spec.
 
             `SubAgent` entries are invoked through the `task` tool. They should
-            provide `name`, `description`, and `system_prompt`, and may also
-            override `tools`, `model`, `middleware`, `interrupt_on`, `skills`,
-            `permissions`, and `response_format`. See `interrupt_on` below for
-            inheritance and override behavior.
+            provide `name` and `description`, and may also override
+            `system_prompt`, `tools`, `model`, `middleware`, `interrupt_on`,
+            `skills`, `permissions`, and `response_format`. See `interrupt_on`
+            below for inheritance and override behavior.
+
+            Setting `mode="fork"` on a `SubAgent` is experimental. A fork
+            continues the parent's conversation and rebuilds its system prompt
+            instead of starting isolated; any `system_prompt` of its own is appended to
+            the inherited one, and it cannot define `skills`.
 
             `CompiledSubAgent` entries are also exposed through the `task` tool,
             but provide a pre-built `runnable` instead of a declarative prompt
@@ -520,6 +547,10 @@ def create_deep_agent(  # noqa: C901, PLR0912, PLR0915  # Complex graph assembly
             [`SubAgent`][deepagents.middleware.subagents.SubAgent] specs for
             the `task` tool, so subagents see the same custom fields as the
             parent.
+
+            Those subagents can also write the fields back to the parent. If
+            parallel `task` calls may change the same field, give it a
+            reducer; otherwise the step fails with `InvalidUpdateError`.
 
             [`CompiledSubAgent`][deepagents.middleware.subagents.CompiledSubAgent]
             runnables do not inherit this schema because they are already
@@ -626,17 +657,31 @@ def create_deep_agent(  # noqa: C901, PLR0912, PLR0915  # Complex graph assembly
 
     backend = backend if backend is not None else StateBackend()
 
+    base_prompt = _apply_profile_prompt(_profile, "")
+    if system_prompt is None:
+        final_system_prompt: str | SystemMessage = base_prompt
+    elif isinstance(system_prompt, SystemMessage):
+        if base_prompt:
+            final_system_prompt = SystemMessage(content_blocks=[*system_prompt.content_blocks, {"type": "text", "text": f"\n\n{base_prompt}"}])
+        else:
+            final_system_prompt = system_prompt
+    else:
+        final_system_prompt = system_prompt + (f"\n\n{base_prompt}" if base_prompt else "")
+
     # The built-in tool-usage guidance prose duplicates the tools' own schema
     # descriptions, so the deepagents-owned middleware (filesystem / subagent /
     # async-subagent) default to emitting none of it; only the essential dynamic
     # bits remain (filesystem's host-path routing, empty for non-composite
     # backends; the available-agent list, which reaches the model through the
-    # `task` tool / async tools). `TodoListMiddleware` is from langchain and
-    # defaults to its full prompt, so it is the one middleware passed
-    # `system_prompt=""` here to trim it. Skills and Memory keep their fragment:
-    # it is the only channel that surfaces the loaded skill index / memory
-    # content, and both are built only when the caller passes `skills=` /
-    # `memory=`.
+    # `task` tool / async tools). Skills and Memory keep their fragment: it is
+    # the only channel that surfaces the loaded skill index / memory content,
+    # and both are built only when the caller passes `skills=` / `memory=`.
+
+    # A custom `SkillsMiddleware` replaces the default by name, but the default
+    # only exists when `skills` is passed. Take `skills` from its sources so it
+    # lands in the default's slot and reaches the general-purpose subagent.
+    if skills is None:
+        skills = _passed_skills_sources(middleware or ())
 
     # Process caller-supplied subagents first so the decision of whether to
     # auto-add the default general-purpose subagent can factor in an explicit
@@ -645,11 +690,16 @@ def create_deep_agent(  # noqa: C901, PLR0912, PLR0915  # Complex graph assembly
     inline_subagents: list[SubAgent | CompiledSubAgent] = []
     async_subagents: list[AsyncSubAgent] = []
     for spec in subagents or []:
-        if "runnable" in spec:
+        if "graph_id" in spec:
+            # Then spec is an AsyncSubAgent
+            async_subagents.append(cast("AsyncSubAgent", spec))
+            continue
+        if _is_compiled_subagent(spec):
             # CompiledSubAgent - use as-is
-            processed_subagents.append(spec)
+            inline_subagents.append(spec)
         else:
-            # SubAgent - fill in defaults and prepend base middleware
+            # Declarative subagent - fill in defaults and prepend base middleware
+            is_forked = _is_forked_subagent(spec)
             raw_subagent_model = spec.get("model", model)
             subagent_model = resolve_model(raw_subagent_model)
 
@@ -659,7 +709,17 @@ def create_deep_agent(  # noqa: C901, PLR0912, PLR0915  # Complex graph assembly
             # Resolve permissions: subagent's own rules take priority, else inherit parent's
             subagent_permissions = spec.get("permissions", permissions)
 
-            # Build middleware: base stack + skills (if specified) + user's middleware
+            # A fork inherits the main agent's skills and can't set its own. As
+            # for the main agent, a `SkillsMiddleware` in the spec's own
+            # `middleware` takes the skills slot when there are no `skills`.
+            subagent_skills = skills if is_forked else (spec.get("skills") or None)
+            if subagent_skills is None:
+                subagent_skills = _passed_skills_sources(spec.get("middleware", []))
+
+            # Build middleware: base stack + user's middleware + profile + skills (if specified).
+            # A fork also mirrors the parent's prompt-producing middleware, in the
+            # parent's order, so its own stack rebuilds the parent's system message
+            # from the inherited state.
             subagent_middleware: list[AgentMiddleware[Any, Any, Any]] = [
                 FilesystemMiddleware(
                     backend=backend,
@@ -667,18 +727,20 @@ def create_deep_agent(  # noqa: C901, PLR0912, PLR0915  # Complex graph assembly
                     _permissions=subagent_permissions,
                 ),
                 create_summarization_middleware(subagent_model, backend),
-                AnthropicPromptCachingMiddleware(unsupported_model_behavior="ignore"),
                 PatchToolCallsMiddleware(),
             ]
-            subagent_skills = spec.get("skills")
-            if subagent_skills:
-                subagent_middleware.append(SkillsMiddleware(backend=backend, sources=subagent_skills))
-            # Core names captured before the tail so new spec middleware splices in ahead of it.
+            # Core names captured before the tail so new spec middleware (and a
+            # fork's inherited parent middleware) splices in ahead of it,
+            # including ahead of Skills.
             _subagent_core_names = {m.name for m in subagent_middleware}
             # Harness-profile middleware for this subagent's model
             subagent_middleware.extend(_subagent_profile.materialize_extra_middleware())
+            if subagent_skills is not None:
+                subagent_middleware.append(SkillsMiddleware(backend=backend, sources=subagent_skills))
 
             append_prompt_caching_middleware(subagent_middleware)
+            if is_forked and memory is not None:
+                subagent_middleware.append(MemoryMiddleware(backend=backend, sources=memory, add_cache_control=True))
 
             _subagent_matched_classes: set[type[AgentMiddleware[Any, Any, Any]]] = set()
             _subagent_matched_names: set[str] = set()
@@ -693,9 +755,14 @@ def create_deep_agent(  # noqa: C901, PLR0912, PLR0915  # Complex graph assembly
                 matched_classes=_subagent_matched_classes,
                 matched_names=_subagent_matched_names,
             )
+            subagent_custom_middleware = list(spec.get("middleware", []))
+            if is_forked and middleware:
+                # `create_agent` rejects two middleware sharing a name, so a spec
+                # entry replaces the inherited one in place rather than adding to it.
+                subagent_custom_middleware = list({m.name: m for m in [*middleware, *subagent_custom_middleware]}.values())
             subagent_middleware = _apply_custom_middleware(
                 subagent_middleware,
-                spec.get("middleware", []),
+                subagent_custom_middleware,
                 core_names=_subagent_core_names,
             )
             subagent_middleware = _apply_excluded_middleware(
@@ -716,7 +783,7 @@ def create_deep_agent(  # noqa: C901, PLR0912, PLR0915  # Complex graph assembly
 
             subagent_interrupt_on = spec.get("interrupt_on", interrupt_on)
             subagent_interrupt_on = _merge_fs_interrupt_on(
-                _build_interrupt_on_from_permissions(subagent_permissions or []),
+                _build_interrupt_on_from_permissions(subagent_permissions or [], backend),
                 subagent_interrupt_on,
             )
 
@@ -728,16 +795,29 @@ def create_deep_agent(  # noqa: C901, PLR0912, PLR0915  # Complex graph assembly
                 _subagent_profile.tool_description_overrides,
             )
 
-            processed_spec: SubAgent = {
+            processed: dict[str, Any] = {
                 **spec,
                 "model": subagent_model,
                 "tools": subagent_tools or [],
                 "middleware": subagent_middleware,
             }
-            processed_spec["system_prompt"] = _apply_profile_prompt(_subagent_profile, spec["system_prompt"])
+            if is_forked:
+                # The parent's prompt is the fork's base; the fork's own is an addendum.
+                fork_addendum = spec.get("system_prompt")
+                if not fork_addendum:
+                    processed["system_prompt"] = final_system_prompt
+                elif isinstance(final_system_prompt, SystemMessage):
+                    processed["system_prompt"] = append_to_system_message(final_system_prompt, fork_addendum)
+                else:
+                    processed["system_prompt"] = f"{final_system_prompt}\n\n{fork_addendum}" if final_system_prompt else fork_addendum
+            else:
+                processed["system_prompt"] = _apply_profile_prompt(_subagent_profile, spec.get("system_prompt", ""))
             if subagent_interrupt_on is not None:
-                processed_spec["interrupt_on"] = subagent_interrupt_on
-            inline_subagents.append(processed_spec)
+                processed["interrupt_on"] = subagent_interrupt_on
+            if is_forked:
+                inline_subagents.append(cast("SubAgent", processed))
+            else:
+                inline_subagents.append(cast("SubAgent", processed))
 
     # Auto-add the default general-purpose subagent unless the harness profile
     # disables it or the caller already supplied their own — an explicit spec
@@ -755,11 +835,11 @@ def create_deep_agent(  # noqa: C901, PLR0912, PLR0915  # Complex graph assembly
             create_summarization_middleware(model, backend),
             PatchToolCallsMiddleware(),
         ]
-        if skills is not None:
-            gp_middleware.append(SkillsMiddleware(backend=backend, sources=skills))
 
         # Add harness-profile middleware, if any
         gp_middleware.extend(_profile.materialize_extra_middleware())
+        if skills is not None:
+            gp_middleware.append(SkillsMiddleware(backend=backend, sources=skills))
 
         append_prompt_caching_middleware(gp_middleware)
         _gp_original_name_to_index = {m.name: i for i, m in enumerate(gp_middleware)}
@@ -802,7 +882,7 @@ def create_deep_agent(  # noqa: C901, PLR0912, PLR0915  # Complex graph assembly
         else:
             general_purpose_spec["system_prompt"] = _apply_profile_prompt(_profile, GENERAL_PURPOSE_SUBAGENT["system_prompt"])
         gp_interrupt_on = _merge_fs_interrupt_on(
-            _build_interrupt_on_from_permissions(permissions or []),
+            _build_interrupt_on_from_permissions(permissions or [], backend),
             interrupt_on,
         )
         if gp_interrupt_on is not None:
@@ -811,16 +891,13 @@ def create_deep_agent(  # noqa: C901, PLR0912, PLR0915  # Complex graph assembly
         inline_subagents.insert(0, general_purpose_spec)
 
     # Build main agent middleware stack
-    deepagent_middleware: list[AgentMiddleware[Any, Any, Any]] = []
-    if skills is not None:
-        deepagent_middleware.append(SkillsMiddleware(backend=backend, sources=skills))
-    deepagent_middleware.append(
+    deepagent_middleware: list[AgentMiddleware[Any, Any, Any]] = [
         FilesystemMiddleware(
             backend=backend,
             custom_tool_descriptions=_profile.tool_description_overrides,
             _permissions=permissions,
-        )
-    )
+        ),
+    ]
     sub_agent_middleware: SubAgentMiddleware | None = None
     if inline_subagents:
         sub_agent_middleware = SubAgentMiddleware(
@@ -837,8 +914,8 @@ def create_deep_agent(  # noqa: C901, PLR0912, PLR0915  # Complex graph assembly
         deepagent_middleware.append(sub_agent_middleware)
     deepagent_middleware.extend(
         [
+            _ParentNotifierMiddleware(),
             create_summarization_middleware(model, backend),
-            AnthropicPromptCachingMiddleware(unsupported_model_behavior="ignore"),
             PatchToolCallsMiddleware(),
         ]
     )
@@ -855,6 +932,12 @@ def create_deep_agent(  # noqa: C901, PLR0912, PLR0915  # Complex graph assembly
     # that memory updates (which change the system prompt) don't invalidate the
     # Anthropic prompt cache prefix.
     deepagent_middleware.extend(_profile.materialize_extra_middleware())
+    if skills is not None:
+        # Innermost before caching, so skill tool disclosure sees the compacted
+        # conversation and the model actually called (after user fallback or
+        # routing middleware). Kept out of `_main_core_names` so novel user
+        # middleware still lands ahead of it.
+        deepagent_middleware.append(SkillsMiddleware(backend=backend, sources=skills))
     append_prompt_caching_middleware(deepagent_middleware)
     if memory is not None:
         # MemoryMiddleware applies the cache_control breakpoint only when the
@@ -867,11 +950,12 @@ def create_deep_agent(  # noqa: C901, PLR0912, PLR0915  # Complex graph assembly
             )
         )
     main_interrupt_on = _merge_fs_interrupt_on(
-        _build_interrupt_on_from_permissions(permissions or []),
+        _build_interrupt_on_from_permissions(permissions or [], backend),
         interrupt_on,
     )
     if main_interrupt_on is not None:
         deepagent_middleware.append(HumanInTheLoopMiddleware(interrupt_on=main_interrupt_on))
+    deepagent_middleware.append(UnsupportedContentMiddleware())
     deepagent_middleware = _apply_excluded_middleware(
         deepagent_middleware,
         _profile,
@@ -892,8 +976,10 @@ def create_deep_agent(  # noqa: C901, PLR0912, PLR0915  # Complex graph assembly
     state_schemas = [state_schema] if state_schema is not None else []
     state_schemas.extend(mw.state_schema for mw in deepagent_middleware if getattr(mw, "state_schema", None) is not None)
     private_state_keys = private_state_field_names(*state_schemas)
-    if sub_agent_middleware is not None:
-        sub_agent_middleware.private_state_keys = private_state_keys
+    # Apply the keys after caller middleware has replaced the task middleware.
+    for middleware_instance in deepagent_middleware:
+        if isinstance(middleware_instance, SubAgentMiddleware):
+            middleware_instance.private_state_keys = middleware_instance.private_state_keys | private_state_keys
     # Verify every main-profile exclusion matched at least one middleware in
     # either the main agent stack or the GP subagent stack. An entry that
     # matched nothing across both is almost certainly a typo or a stale
@@ -905,17 +991,6 @@ def create_deep_agent(  # noqa: C901, PLR0912, PLR0915  # Complex graph assembly
         required_classes=_REQUIRED_MIDDLEWARE_CLASSES,
         required_names=_REQUIRED_MIDDLEWARE_NAMES,
     )
-
-    base_prompt = _apply_profile_prompt(_profile, "")
-    if system_prompt is None:
-        final_system_prompt: str | SystemMessage = base_prompt
-    elif isinstance(system_prompt, SystemMessage):
-        if base_prompt:
-            final_system_prompt = SystemMessage(content_blocks=[*system_prompt.content_blocks, {"type": "text", "text": f"\n\n{base_prompt}"}])
-        else:
-            final_system_prompt = system_prompt
-    else:
-        final_system_prompt = system_prompt + (f"\n\n{base_prompt}" if base_prompt else "")
 
     return create_agent(
         model,
@@ -935,7 +1010,7 @@ def create_deep_agent(  # noqa: C901, PLR0912, PLR0915  # Complex graph assembly
             "recursion_limit": 9_999,
             "metadata": {
                 "ls_integration": "deepagents",
-                "lc_versions": {"deepagents": __version__},
+                "lc_versions": {"deepagents": _lc_version()},
                 "lc_agent_name": name,
             },
         }

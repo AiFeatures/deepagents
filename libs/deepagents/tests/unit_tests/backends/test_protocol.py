@@ -47,19 +47,19 @@ class TestBackendProtocolRaisesNotImplemented:
 
     def test_ls_info(self, backend: BareBackend) -> None:
         with pytest.raises(NotImplementedError):
-            backend.ls_info("/")
+            backend.ls("/")
 
     def test_read(self, backend: BareBackend) -> None:
         with pytest.raises(NotImplementedError):
             backend.read("/file.txt")
 
-    def test_grep_raw(self, backend: BareBackend) -> None:
+    def test_grep(self, backend: BareBackend) -> None:
         with pytest.raises(NotImplementedError):
-            backend.grep_raw("pattern")
+            backend.grep("pattern")
 
-    def test_glob_info(self, backend: BareBackend) -> None:
+    def test_glob(self, backend: BareBackend) -> None:
         with pytest.raises(NotImplementedError):
-            backend.glob_info("*.py")
+            backend.glob("*.py")
 
     def test_write(self, backend: BareBackend) -> None:
         with pytest.raises(NotImplementedError):
@@ -95,19 +95,19 @@ class TestAsyncMethodsPropagateNotImplemented:
 
     async def test_als_info(self, backend: BareBackend) -> None:
         with pytest.raises(NotImplementedError):
-            await backend.als_info("/")
+            await backend.als("/")
 
     async def test_aread(self, backend: BareBackend) -> None:
         with pytest.raises(NotImplementedError):
             await backend.aread("/file.txt")
 
-    async def test_agrep_raw(self, backend: BareBackend) -> None:
+    async def test_agrep(self, backend: BareBackend) -> None:
         with pytest.raises(NotImplementedError):
-            await backend.agrep_raw("pattern")
+            await backend.agrep("pattern")
 
-    async def test_aglob_info(self, backend: BareBackend) -> None:
+    async def test_aglob(self, backend: BareBackend) -> None:
         with pytest.raises(NotImplementedError):
-            await backend.aglob_info("*.py")
+            await backend.aglob("*.py")
 
     async def test_awrite(self, backend: BareBackend) -> None:
         with pytest.raises(NotImplementedError):
@@ -322,3 +322,22 @@ class TestReadResultPaginationInvariants:
     def test_malformed_combinations_raise(self, kwargs: dict[str, int]) -> None:
         with pytest.raises(ValueError, match="ReadResult"):
             ReadResult(**kwargs)
+
+    def test_no_lines_requested_valid_window(self) -> None:
+        """The zero-line flag is valid on its own with empty file data."""
+        result = ReadResult(file_data={"content": "", "encoding": "utf-8"}, no_lines_requested=True)
+        assert result.no_lines_requested is True
+
+    @pytest.mark.parametrize(
+        "kwargs",
+        [
+            pytest.param({"error": "boom"}, id="with_error"),
+            pytest.param({"start_line": 1, "end_line": 1}, id="with_window"),
+            pytest.param({"total_lines": 3, "start_line": 1, "end_line": 1}, id="with_total"),
+            pytest.param({"start_line": 1, "end_line": 1, "next_offset": 1}, id="with_next_offset"),
+        ],
+    )
+    def test_no_lines_requested_rejects_other_dispositions(self, kwargs: dict) -> None:
+        """A never-inspected window cannot also claim an error or a line range."""
+        with pytest.raises(ValueError, match="no_lines_requested"):
+            ReadResult(no_lines_requested=True, **kwargs)

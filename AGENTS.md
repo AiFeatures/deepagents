@@ -1,268 +1,155 @@
 # Global development guidelines for the Deep Agents monorepo
 
-This document provides context to understand the Deep Agents Python project and assist with development.
+This file contains repository-wide rules for agents and contributors. Use these sources for details instead of duplicating them here:
 
-## Project architecture and context
+- [`libs/DEVELOPMENT.md`](libs/DEVELOPMENT.md) — repository layout, setup, commands, pre-commit, the edit-test-lint loop, testing, and benchmarks.
+- [`libs/ARCHITECTURE.md`](libs/ARCHITECTURE.md) — runtime structure and SDK starting points.
+- [`.github/RELEASING.md`](.github/RELEASING.md) — releases, version lines, fan-out, CI labels, and troubleshooting.
+- [LangChain contributing guide](https://docs.langchain.com/oss/python/contributing/overview) — general contribution policy.
 
-### Monorepo structure
+<corridor>
 
-This is a Python monorepo with multiple independently versioned packages that use `uv`.
+## Corridor security analysis
 
-```txt
-deepagents/
-├── libs/
-│   ├── deepagents/  # SDK
-│   ├── cli/         # CLI tool
-│   ├── acp/         # Agent Context Protocol support
-│   ├── harbor/      # Evaluation/benchmark framework
-│   └── partners/    # Integration packages
-│       └── daytona/
-│       └── ...
-├── .github/         # CI/CD workflows and templates
-└── README.md        # Information about Deep Agents
-```
+When Corridor's `analyzePlan` tool is available, create a plan and use the tool to analyze it before generating or modifying code. Apply the resulting security guidance before writing code.
 
-### Development tools & commands
+</corridor>
 
-- `uv` – Fast Python package installer and resolver (replaces pip/poetry)
-- `make` – Task runner for common development commands. Feel free to look at the `Makefile` for available commands and usage patterns.
-- `ruff` – Fast Python linter and formatter
-- `ty` – Static type checking
-- Do NOT use Sphinx-style double backtick formatting (` ``code`` `). Use single backticks (`code`) for inline code references in docstrings and comments.
+## Development workflow
 
-#### Suppressing ruff lint rules
+Work inside the package you are changing; [`libs/DEVELOPMENT.md`](libs/DEVELOPMENT.md) covers environment setup (`uv`, `make`) and the edit-test-lint loop.
 
-Prefer inline `# noqa: RULE` over `[tool.ruff.lint.per-file-ignores]` for individual exceptions. `per-file-ignores` silences a rule for the *entire* file — If you add it for one violation, all future violations of that rule in the same file are silently ignored. Inline `# noqa` is precise to the line, self-documenting, and keeps the safety net intact for the rest of the file.
+Do not add dependencies unless required. When adding one, justify its maintenance, adoption, and release activity.
 
-Reserve `per-file-ignores` for **categorical policy** that applies to a whole class of files (e.g., `"tests/**" = ["D1", "S101"]` — tests don't need docstrings, `assert` is expected). These are not exceptions; they are different rules for a different context.
+### Suppressing ruff rules
 
-```toml
-# GOOD – categorical policy in pyproject.toml
-[tool.ruff.lint.per-file-ignores]
-"tests/**" = ["D1", "S101"]
+Use inline `# noqa: RULE` with a justification for individual exceptions. Reserve `[tool.ruff.lint.per-file-ignores]` for categorical policies that apply to a whole class of files, such as tests not requiring docstrings. Do not hide a single violation with a file-wide ignore. If you cannot justify a suppression, the code is probably the problem. See [`libs/DEVELOPMENT.md`](libs/DEVELOPMENT.md#suppressing-ruff-rules) for worked examples.
 
-# BAD – single-line exception buried in pyproject.toml
-"deepagents_cli/agent.py" = ["PLR2004"]
-```
+## PR conventions
 
-```python
-# GOOD – precise, self-documenting inline suppression
-timeout = 30  # noqa: PLR2004  # default HTTP timeout, not arbitrary
-```
+### Titles and scope
 
-- `pytest` – Testing framework
+Follow Conventional Commits and include a scope. Allowed types and scopes are defined in `.github/workflows/pr_lint.yml`.
 
-This monorepo uses `uv` for dependency management. Local development uses editable installs: `[tool.uv.sources]`
+- Start the text after `type(scope):` with a lowercase letter unless it begins with a proper noun or named code entity.
+- Wrap class, function, method, parameter, and variable names in backticks.
+- Do not put Linear issue-closing markers in titles; put issue relationships in the PR body.
+- For version-branch syncs, use `chore(repo): sync main into vX.Y`; `release` is a type, not a scope.
+- PRs should generally leave `README.md` files unchanged, including root and package READMEs. Only modify them when explicitly requested or necessary to correct information made inaccurate by the PR; avoid incidental README edits.
+- Keep each bump-worthy PR to one releasable component. Put cross-package dependency or lockfile churn in a separate `chore(deps):` PR. See [multi-component fan-out](.github/RELEASING.md#multi-component-fan-out) and [lockfile churn fan-out](.github/RELEASING.md#lockfile-churn-fan-out).
 
-Each package in `libs/` has its own `pyproject.toml` and `uv.lock`.
+### Branch naming
 
-```bash
-# Run unit tests (no network)
-make test
+Name branches `<github-username>/<scope>/<short-description>`, where the description is brief kebab-case. Use the same scope as the PR title, except documentation-only branches may use the branch-only `docs` scope.
 
-# Run specific test file
-uv run --group test pytest tests/unit_tests/test_specific.py
-```
+### PR bodies
 
-```bash
-# Lint code
-make lint
+Follow [the PR template](.github/PULL_REQUEST_TEMPLATE.md).
 
-# Format code
-make format
-```
-
-#### Key config files
-
-- pyproject.toml: Main workspace configuration with dependency groups
-- uv.lock: Locked dependencies for reproducible builds
-- Makefile: Development tasks
-
-#### Commit standards
-
-Suggest PR titles that follow Conventional Commits format. Refer to .github/workflows/pr_lint for allowed types and scopes. Note that all commit/PR titles should be in lowercase with the exception of proper nouns/named entities. All PR titles should include a scope with no exceptions. For example:
-
-```txt
-feat(sdk): add new chat completion feature
-fix(cli): resolve type hinting issue
-chore(harbor): update infrastructure dependencies
-```
-
-- Do NOT use Sphinx-style double backtick formatting (` ``code`` `). Use single backticks (`code`) for inline code references in docstrings and comments.
-
-#### Pull request guidelines
-
-- Always add a disclaimer to the PR description mentioning how AI agents are involved with the contribution.
-- Describe the "why" of the changes, why the proposed solution is the right one. Limit prose.
-- Highlight areas of the proposed changes that require careful review.
+- An issue relationship line is optional; only `Closes`, `Fixes`, and `Resolves` auto-close issues.
+- For features and behavior-changing fixes, place one plain-English user-visible summary above `---`. It is the release note; do not add a release-note heading or repeat it below the divider. Omit it for chores, refactors, and test-only changes.
+- Below `---`, explain why the change is needed and why the approach is appropriate. Keep prose concise and public-reader friendly.
+- Do not cite line numbers. Prefer symbols or subsystems over full paths, and format code entities with backticks.
 
 ## Core development principles
 
-### Maintain stable public interfaces
+### Public interfaces
 
-CRITICAL: Always attempt to preserve function signatures, argument positions, and names for exported/public methods. Do not make breaking changes.
+Preserve exported function signatures, argument positions, and names. Before changing a public API:
 
-You should warn the developer for any function signature changes, regardless of whether they look breaking or not.
+- Check exports in `__init__.py` and usage in tests and examples.
+- Add new parameters as keyword-only with defaults.
+- Mark experimental features with MkDocs Material docstring warnings.
+- Warn the developer about any signature change, even if it appears compatible.
 
-**Before making ANY changes to public APIs:**
+### Code and documentation
 
-- Check if the function/class is exported in `__init__.py`
-- Look for existing usage patterns in tests and examples
-- Use keyword-only arguments for new parameters: `*, new_param: str = "default"`
-- Mark experimental features clearly with docstring warnings (using MkDocs Material admonitions, like `!!! warning`)
+- Add type hints and return types to Python code. Avoid `Any`; use a precise type and follow local patterns.
+- Use Google-style docstrings for public functions ([template](libs/DEVELOPMENT.md#docstrings)). Put types in signatures, not docstrings; do not repeat defaults unless post-processing or conditional behavior changes them.
+- Document public parameters, return values, and exceptions concisely, focusing on why rather than restating code.
+- Use American English and single backticks for inline code; do not use Sphinx-style double backticks.
+- Use descriptive variable names. Prefer a single word when it reads clearly.
+- Keep functions under about 20 lines. Split a longer one into focused helpers.
+- Build error text in a `msg` variable and raise with it, matching the surrounding code.
+- Remove unreachable or commented-out code before committing.
 
-Ask: "Would this change break someone's code if they used it last week?"
+When adding or updating model names in docs, examples, or defaults, verify the latest generally available IDs in the provider's official documentation. Do not rely on remembered model names.
 
-### Code quality standards
+### Testing
 
-All Python code MUST include type hints and return types.
+Add unit coverage when it meaningfully protects changed observable behavior; do not add tests solely to accompany every change.
 
-```python title="Example"
-def filter_unknown_users(users: list[str], known_users: set[str]) -> list[str]:
-    """Single line description of the function.
+- Put network-free tests in `tests/unit_tests/` and networked tests in `tests/integration_tests/`.
+- Do not add `@pytest.mark.asyncio`; packages use `asyncio_mode = "auto"`.
+- Test observable behavior rather than duplicating implementation logic. Do not add change-detector tests that merely restate the current code structure or assert incidental interactions, such as internal call order, without proving meaningful behavior. Refactors that preserve behavior should not require mechanical test updates; rewrite or remove tests that do. Cover edge cases and keep tests deterministic.
 
-    Any additional context about the function can go here.
+#### Warnings are errors
 
-    Args:
-        users: List of user identifiers to filter.
-        known_users: Set of known/valid user identifiers.
+All packages treat unaccepted pytest warnings as errors. Fix actionable warnings before adding filters. See [`libs/DEVELOPMENT.md`](libs/DEVELOPMENT.md#warnings-fail-the-suite) for how a stray warning surfaces and for the `bypass-warnings-check` label.
 
-    Returns:
-        List of users that are not in the `known_users` set.
-    """
-```
+Keep this heading stable: package `pyproject.toml` comments cite it by name.
 
-- Use descriptive, self-explanatory variable names.
-- Follow existing patterns in the codebase you're modifying
-- Attempt to break up complex functions (>20 lines) into smaller, focused functions where it makes sense
-- Avoid using the `any` type
-- Prefer single word variable names where possible
+- Scope an expected warning to the test with `@pytest.mark.filterwarnings`; reserve package-level entries for categorical or third-party warnings and justify them.
+- Prefer `default::` to `ignore::` for warnings such as `PytestUnhandledThreadExceptionWarning` and `PytestUnraisableExceptionWarning`, so failures remain visible.
+- Warning filter message fields in ini files are unescaped regexes. Escape literal metacharacters and stop message prefixes before warning-text colons.
+- Keep a message-scoped prefix narrow enough that it cannot swallow an adjacent warning.
+- A filter may be version-specific, such as one that only fires on Python 3.14. A filter that matches nothing is harmless.
 
-### Testing requirements
+### Security and resources
 
-Every new feature or bugfix MUST be covered by unit tests.
+Do not use `eval()`, `exec()`, or `pickle` on user-controlled input. Avoid bare `except:` blocks, clean up files, connections, sockets, and threads, and check changes for leaks or races.
 
-- Unit tests: `tests/unit_tests/` (no network calls allowed)
-- Integration tests: `tests/integration_tests/` (network calls permitted)
-- We use `pytest` as the testing framework; if in doubt, check other existing tests for examples.
-- Do NOT add `@pytest.mark.asyncio` to async tests — every package sets `asyncio_mode = "auto"` in `pyproject.toml`, so pytest-asyncio discovers them automatically.
-- The testing file structure should mirror the source code structure.
-- Avoid mocks as much as possible
-- Test actual implementation, do not duplicate logic into tests
+## Repository routing
 
-Ensure the following:
+### SDK and dependencies
 
-- Does the test suite fail if your new logic is broken?
-- Edge cases and error conditions are tested
-- Tests are deterministic (no flaky tests)
+For SDK architecture and common starting points, use [`libs/ARCHITECTURE.md`](libs/ARCHITECTURE.md). Deep Agents delegates graph assembly to LangChain's `create_agent`; when investigating dependency internals, locate and read the installed dependency source directly.
 
-### Security and risk assessment
+### Search hygiene
 
-- No `eval()`, `exec()`, or `pickle` on user-controlled input
-- Proper exception handling (no bare `except:`) and use a `msg` variable for error messages
-- Remove unreachable/commented code before committing
-- Race conditions or resource leaks (file handles, sockets, threads).
-- Ensure proper resource cleanup (file handles, connections)
+Avoid broad repository searches during normal SDK work. Target these paths:
 
-### Documentation standards
+- SDK source and tests: `libs/deepagents/deepagents`, `libs/deepagents/tests`
+- Coding agent: `libs/code`
+- ACP: `libs/acp`
+- Talon: `libs/talon`
+- Evals: `libs/evals`
+- Partner packages: `libs/partners/<partner>`
 
-Use Google-style docstrings with Args section for all public functions.
+Exclude package `.venv` directories, hidden worktrees, `deepagents.egg-info`, generated metadata, benchmark results, and scratch files unless needed. For dependency internals, find the exact environment file instead of searching all of `site-packages`.
 
-```python title="Example"
-def send_email(to: str, msg: str, *, priority: str = "normal") -> bool:
-    """Send an email to a recipient with specified priority.
+### Scoped guides
 
-    Any additional context about the function can go here.
+- [`libs/code/AGENTS.md`](libs/code/AGENTS.md) — Textual, startup performance, slash commands, providers, and the SDK pin.
+- [`libs/evals/AGENTS.md`](libs/evals/AGENTS.md) — eval commands, reports, and Harbor integration.
+- [`libs/partners/AGENTS.md`](libs/partners/AGENTS.md) — partner-package CI and release wiring.
+- [`libs/code/DEVELOPMENT.md`](libs/code/DEVELOPMENT.md) — coding-agent setup and local development.
+- [`.github/LAYOUT.md`](.github/LAYOUT.md) — map of CI workflows, composite actions, and labeling.
 
-    Args:
-        to: The email address of the recipient.
-        msg: The message body to send.
-        priority: Email priority level.
+`deepagents-code` is the terminal coding agent launched by `dcode`.
+### Benchmarks
 
-    Returns:
-        `True` if email was sent successfully, `False` otherwise.
+Benchmarks live in `deepagents`, `code`, and `partners/quickjs`; other packages have no `bench` target. Use the package's `bench` and `bench-memory` Make targets rather than invoking pytest directly — they are the source of truth for local and CI invocation. See [`libs/DEVELOPMENT.md`](libs/DEVELOPMENT.md#benchmarks) for commands, thresholds, dashboards, and the nightly sweep.
 
-    Raises:
-        InvalidEmailError: If the email address format is invalid.
-        SMTPConnectionError: If unable to connect to email server.
-    """
-```
+## CI and releases
 
-- Types go in function signatures, NOT in docstrings
-  - If a default is present, DO NOT repeat it in the docstring unless there is post-processing or it is set conditionally.
-- Focus on "why" rather than "what" in descriptions
-- Document all parameters, return values, and exceptions
-- Keep descriptions concise but clear
-- Ensure American English spelling (e.g., "behavior", not "behaviour")
-- Do NOT use Sphinx-style double backtick formatting (` ``code`` `). Use single backticks (`code`) for inline code references in docstrings and comments.
+Use [`.github/RELEASING.md`](.github/RELEASING.md) for release-please behavior, version branches, changelog overrides, reverts, and release troubleshooting, including the CI guardrails that gate a release. Use [`.github/LAYOUT.md`](.github/LAYOUT.md) to find a workflow by what it does. Workflow files are authoritative for linting and labeling behavior.
 
-## Package-specific guidance
-
-### Deep Agents CLI (`libs/cli/`)
-
-`deepagents-cli` uses [Textual](https://textual.textualize.io/) for its terminal UI framework.
-
-**Key Textual resources:**
-
-- **Guide:** https://textual.textualize.io/guide/
-- **Widget gallery:** https://textual.textualize.io/widget_gallery/
-- **CSS reference:** https://textual.textualize.io/styles/
-- **API reference:** https://textual.textualize.io/api/
-
-**Textual patterns used in this codebase:**
-
-- **Workers** (`@work` decorator) for async operations - see [Workers guide](https://textual.textualize.io/guide/workers/)
-- **Message passing** for widget communication - see [Events guide](https://textual.textualize.io/guide/events/)
-- **Reactive attributes** for state management - see [Reactivity guide](https://textual.textualize.io/guide/reactivity/)
-
-**SDK dependency pin:**
-
-The CLI pins an exact `deepagents==X.Y.Z` version in `libs/cli/pyproject.toml`. When developing CLI features that depend on new SDK functionality, bump this pin as part of the same PR. A CI check verifies the pin matches the current SDK version at release time (unless bypassed with `dangerous-skip-sdk-pin-check`).
-
-**Startup performance:**
-
-The CLI must stay fast to launch. Never import heavy packages (e.g., `deepagents`, LangChain, LangGraph) at module level or in the argument-parsing path. These imports pull in large dependency trees and add seconds to every invocation, including trivial commands like `deepagents -v`.
-
-- Keep top-level imports in `main.py` and other entry-point modules minimal.
-- Defer heavy imports to the point where they are actually needed (inside functions/methods).
-- To read another package's version without importing it, use `importlib.metadata.version("package-name")`.
-
-**CLI help screen:**
-
-The `deepagents --help` screen is hand-maintained in `ui.show_help()`, separate from the argparse definitions in `main.parse_args()`. When adding a new CLI flag, update **both** files. A drift-detection test (`test_args.TestHelpScreenDrift`) fails if a flag is registered in argparse but missing from the help screen.
-
-**Slash commands:**
-
-Slash commands are defined in `SLASH_COMMANDS` in `libs/cli/deepagents_cli/widgets/autocomplete.py` as `(name, description, hidden_keywords)` tuples. Hidden keywords are space-separated terms that participate in fuzzy matching but are never displayed. To add an alias for an existing command, append it to the `hidden_keywords` string — do not create a duplicate command entry. For example, `/threads` has `sessions` as a hidden keyword so typing "sessions" surfaces it.
-
-**Adding a new model provider:**
-
-The CLI supports LangChain-based chat model providers as optional dependencies. To add a new provider, update these files (all entries alphabetically sorted):
-
-1. `libs/cli/deepagents_cli/model_config.py` — add `"provider_name": "ENV_VAR_NAME"` to `PROVIDER_API_KEY_ENV`
-2. `libs/cli/pyproject.toml` — add `provider = ["langchain-provider>=X.Y.Z,<N.0.0"]` to `[project.optional-dependencies]` and include it in the `all-providers` composite extra
-3. `libs/cli/tests/unit_tests/test_model_config.py` — add `assert PROVIDER_API_KEY_ENV["provider_name"] == "ENV_VAR_NAME"` to `TestProviderApiKeyEnv.test_contains_major_providers`
-
-**Not required** unless the provider's models have a distinctive name prefix (like `gpt-*`, `claude*`, `gemini*`):
-
-- `detect_provider()` in `config.py` — only needed for auto-detection from bare model names
-- `Settings.has_*` property in `config.py` — only needed if referenced by `detect_provider()` fallback logic
-
-Model discovery, credential checking, and UI integration are automatic once `PROVIDER_API_KEY_ENV` is populated and the `langchain-*` package is installed.
-
-**Building chat/streaming interfaces:**
-
-- Blog post: [Anatomy of a Textual User Interface](https://textual.textualize.io/blog/2024/09/15/anatomy-of-a-textual-user-interface/) - demonstrates building an AI chat interface with streaming responses
-
-**Testing Textual apps:**
-
-- Use `textual.pilot` for async UI testing - see [Testing guide](https://textual.textualize.io/guide/testing/)
-- Snapshot testing available for visual regression - see repo `notes/snapshot_testing.md`
+Pin GitHub Actions to full-length commit SHAs; a tag reference is rejected. Verify whether a tag is annotated and dereference it before using its commit. Use the `gh` CLI to resolve one.
 
 ## Additional resources
 
-- **Documentation:** https://docs.langchain.com/oss/python/deepagents/overview and source at https://github.com/langchain-ai/docs or `../docs/`. Prefer the local install and use file search tools for best results. If needed, use the docs MCP server as defined in `.mcp.json` for programmatic access.
-- **Contributing Guide:** [Contributing Guide](https://docs.langchain.com/oss/python/contributing/overview)
-- **CLI Release Process:** See `.github/RELEASING.md` for the full CLI release workflow (release-please, version bumping, troubleshooting failed releases, and label management).
+- [Deep Agents documentation](https://docs.langchain.com/oss/python/deepagents/overview) — source lives in the `langchain-ai/docs` repo; a local checkout supports file search, and the docs MCP server is configured in `.mcp.json`
 
-- Do NOT use Sphinx-style double backtick formatting (` ``code`` `). Use single backticks (`code`) for inline code references in docstrings and comments.
+<!-- OPENWIKI:START -->
+
+## OpenWiki
+
+This repository has a generated `openwiki/` evidence index. It is optional just-in-time context, not required startup reading.
+
+- Treat source code and tests as authoritative. A brief's unknowns and review items are verification gaps, not automatic requirements.
+- Prefer the narrowest quiet validation that proves the changed behavior. Preserve complete failure output.
+
+The scheduled OpenWiki GitHub Actions workflow refreshes the repository wiki. Do not hand-edit generated OpenWiki pages unless explicitly asked; prefer updating source code/docs and letting OpenWiki regenerate.
+
+<!-- OPENWIKI:END -->

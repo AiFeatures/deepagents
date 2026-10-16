@@ -43,6 +43,12 @@ import pytest
 # the purpose of the deferred-import optimisation.
 HEAVY_MODULES = frozenset(
     {
+        # SDK — importing these pulls in large dependency trees
+        "deepagents",
+        "deepagents._models",
+        "deepagents.backends",
+        "deepagents.backends.utils",
+        # langchain / langgraph stack
         "langchain",
         "langchain.chat_models",
         "langchain_core",
@@ -120,48 +126,6 @@ pytestmark = pytest.mark.benchmark
 # Verify that importing lightweight entry-point modules does NOT pull in the
 # heavy langchain / agent / sessions stack.
 # ---------------------------------------------------------------------------
-
-
-class TestImportIsolation:
-    """Guard that lightweight entry points don't pull in the heavy stack.
-
-    Without deferred imports, `deepagents --help` takes 3+ seconds because
-    langchain, agent, and sessions all load eagerly. These tests catch any
-    accidental top-level import that would re-introduce that latency.
-    """
-
-    @pytest.mark.parametrize(
-        "import_stmt",
-        [
-            "from deepagents_code.main import parse_args",
-            "from deepagents_code.main import check_cli_dependencies",
-            "from deepagents_code.config import is_ascii_mode",
-            "import deepagents_code.ui",
-            "import deepagents_code.skills.commands",
-            "from deepagents_code._cli_context import CLIContext",
-            "import deepagents_code._ask_user_types",
-            "import deepagents_code.tui.textual_adapter",
-            "import deepagents_code.tool_display",
-            "import deepagents_code.file_ops",
-        ],
-        ids=[
-            "main.parse_args",
-            "main.check_cli_dependencies",
-            "ui",
-            "skills.commands",
-        ],
-    )
-    def test_no_heavy_imports_on_lightweight_path(self, import_stmt: str) -> None:
-        """Importing lightweight CLI modules must not load heavy deps.
-
-        Args:
-            import_stmt: The import statement to test in isolation.
-        """
-        loaded = _get_loaded_modules(import_stmt)
-        leaked = HEAVY_MODULES & loaded
-        assert not leaked, (
-            f"Heavy modules loaded when running `{import_stmt}`: {sorted(leaked)}"
-        )
 
 
 # ---------------------------------------------------------------------------

@@ -93,11 +93,14 @@ Production agents powered by the LangChain stack:
 | [**Ralph Loop**](ralph_mode/) | Autonomous looping with fresh context each iteration, using the filesystem for persistence |
 | [**Agents as Folders**](downloading_agents/) | Download a zip, unzip, and run |
 | [**Better Harness**](better-harness/) | Eval-driven outer-loop optimization of a Deep Agents harness |
+| [**Rubric Middleware**](rubric_middleware/) | Grader-model rubric feedback loop that revises output until all criteria pass |
 
 Each example has its own `README` with setup instructions.
 
 <details>
 <summary><h2>Contributing an example</h2></summary>
+
+See the [Contributing Guide](https://docs.langchain.com/oss/python/contributing/overview) for general contribution guidelines.
 
 When adding a new example:
 

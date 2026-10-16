@@ -1,0 +1,130 @@
+{
+  "schemaVersion": 1,
+  "pageVersion": "sha256:45a38dbe914aeb96e0d64c7ace50cf9483cdd3d1a9660ee291165f90c69411c6",
+  "claims": [
+    {
+      "id": "claim_348ce521c96a4f32a102f91b81305997",
+      "statement": "BaseSandbox derives filesystem behavior from execute and file-transfer primitives, keeps server-side reads and edits in the sandbox where possible, and does not create a separate authorization boundary from shell execution.",
+      "evidence": [
+        {
+          "resource": "repo://libs/deepagents/deepagents/backends/protocol.py",
+          "version": "repo-file-v1:sha256:467cafdc2e18a628cc09a4cee8318b875201935a804147f947c446a3eea2f018"
+        },
+        {
+          "resource": "repo://libs/deepagents/deepagents/backends/sandbox.py",
+          "version": "repo-file-v1:sha256:8654286fec32f300953a66ad32f65a282c3547fbca34efe0cb8d662b1a20ab9a"
+        }
+      ]
+    },
+    {
+      "id": "claim_bdcfa05c51fe4fd79e390fdcb9135a55",
+      "statement": "BaseSandbox output offload is opt-in, preserves a command's exit code while capture is capped, and falls back to the original unoffloaded response when wrapper metadata cannot be parsed.",
+      "evidence": [
+        {
+          "resource": "repo://libs/deepagents/deepagents/backends/sandbox.py",
+          "version": "repo-file-v1:sha256:8654286fec32f300953a66ad32f65a282c3547fbca34efe0cb8d662b1a20ab9a"
+        },
+        {
+          "resource": "repo://libs/deepagents/tests/unit_tests/backends/test_sandbox_backend.py",
+          "version": "repo-file-v1:sha256:3fb707a0a23416e1446817ee83533e2f2cdeff7a9cb66eff1aa19ae8238c29b3"
+        }
+      ]
+    },
+    {
+      "id": "claim_015da03d55b2487a997c98855e97a7f2",
+      "statement": "dcode discovers sandbox providers from built-ins, entry points, and trusted configuration, validates provider capabilities before create or attach, and cleans up only resources created by its factory.",
+      "evidence": [
+        {
+          "resource": "repo://libs/code/deepagents_code/integrations/sandbox_factory.py",
+          "version": "repo-file-v1:sha256:fe92ac5fbfa332ec5cd696499655ced77fb083410461b41cfe86f08fb1c8abbf"
+        },
+        {
+          "resource": "repo://libs/code/deepagents_code/integrations/sandbox_provider.py",
+          "version": "repo-file-v1:sha256:f4592034359301ee4d28a5602f5a1ed0126d37f589773b2c040d5a7c798c8468"
+        },
+        {
+          "resource": "repo://libs/code/deepagents_code/integrations/sandbox_registry.py",
+          "version": "repo-file-v1:sha256:ffa4607804fed9164eccd0d347080738bc240fbd54d8d351bb360ccec3334ef5"
+        }
+      ]
+    },
+    {
+      "id": "claim_e8cf87ffd08d46068737bc024c3ef47a",
+      "statement": "Talon opt-in sandbox mode reuses the dcode lifecycle while routing default filesystem work and execution to the remote backend and keeping only designated skills, memory, and blob paths on host virtual backends.",
+      "evidence": [
+        {
+          "resource": "repo://libs/talon/deepagents_talon/config.py",
+          "version": "repo-file-v1:sha256:20fb3ade8ffcac0cfa85fff02a48b15d17ccdb1d5db574c0690d3fa4b954d832"
+        },
+        {
+          "resource": "repo://libs/talon/deepagents_talon/sandbox.py",
+          "version": "repo-file-v1:sha256:b01ecf1d6602d5bad15ce01d0e481baad436c59da5dcace374fc86e8e74c1e2a"
+        }
+      ]
+    },
+    {
+      "id": "claim_eb30c85718cb4914b7bf9f09ae83d6c2",
+      "statement": "langchain-quickjs 0.3.9 is JavaScript REPL middleware rather than a remote sandbox provider, with direct dependencies on quickjs-rs, Deep Agents, LangChain, LangGraph, and bsdiff4.",
+      "evidence": [
+        {
+          "resource": "repo://libs/partners/quickjs/pyproject.toml",
+          "version": "repo-file-v1:sha256:3e3aa2512be6787354ca5d10b4a05f017e40bfb2fd830ec602b9c4c76c71ecd2"
+        }
+      ]
+    },
+    {
+      "id": "claim_4152ad70d8e64ad683d02df89e5b9daa",
+      "statement": "CodeInterpreterMiddleware isolates QuickJS slots by LangGraph thread, supports thread, turn, and call persistence modes, and uses snapshot size limits and optional slot-bound HMAC verification for persisted thread state.",
+      "evidence": [
+        {
+          "resource": "repo://libs/partners/quickjs/langchain_quickjs/_repl.py",
+          "version": "repo-file-v1:sha256:a878289eb763c651f8c81262bb5e4a229ecad14b0e9981279c8c30ecbcfe7e34"
+        },
+        {
+          "resource": "repo://libs/partners/quickjs/langchain_quickjs/middleware.py",
+          "version": "repo-file-v1:sha256:dec1b4d4dda921f3a0dbe1c0bf354fc3933ceb809be472a9fb1c8dabbf089d51"
+        },
+        {
+          "resource": "repo://libs/partners/quickjs/tests/unit_tests/test_repl_middleware.py",
+          "version": "repo-file-v1:sha256:2456e04b524000ab05b03fa369dbb4583967817cf90c214645af67ab9fed20d3"
+        }
+      ]
+    },
+    {
+      "id": "claim_5ebbca56163e4b24929b9be3913dbce3",
+      "statement": "QuickJS separately limits VM heap, VM time, console and result output, programmatic tool calls, and subagent concurrency; VM time excludes time spent awaiting host bridge calls.",
+      "evidence": [
+        {
+          "resource": "repo://libs/partners/quickjs/langchain_quickjs/_repl.py",
+          "version": "repo-file-v1:sha256:a878289eb763c651f8c81262bb5e4a229ecad14b0e9981279c8c30ecbcfe7e34"
+        },
+        {
+          "resource": "repo://libs/partners/quickjs/langchain_quickjs/middleware.py",
+          "version": "repo-file-v1:sha256:dec1b4d4dda921f3a0dbe1c0bf354fc3933ceb809be472a9fb1c8dabbf089d51"
+        }
+      ]
+    },
+    {
+      "id": "claim_ae7973ff8a41421f99e2856e70bf8f36",
+      "statement": "QuickJS programmatic tool and subagent calls dispatch through REPL bridges rather than the normal ToolNode path, so parent per-dispatch interrupt_on and HITL approval are not enforced.",
+      "evidence": [
+        {
+          "resource": "repo://libs/partners/quickjs/langchain_quickjs/_repl.py",
+          "version": "repo-file-v1:sha256:a878289eb763c651f8c81262bb5e4a229ecad14b0e9981279c8c30ecbcfe7e34"
+        },
+        {
+          "resource": "repo://libs/partners/quickjs/langchain_quickjs/middleware.py",
+          "version": "repo-file-v1:sha256:dec1b4d4dda921f3a0dbe1c0bf354fc3933ceb809be472a9fb1c8dabbf089d51"
+        },
+        {
+          "resource": "repo://libs/partners/quickjs/tests/unit_tests/test_repl_middleware.py",
+          "version": "repo-file-v1:sha256:2456e04b524000ab05b03fa369dbb4583967817cf90c214645af67ab9fed20d3"
+        }
+      ]
+    }
+  ],
+  "verification": {
+    "by": "openwiki/0.4.2",
+    "at": "2026-10-14T08:05:41.101Z"
+  }
+}

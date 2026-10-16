@@ -11,21 +11,26 @@ from deepagents.backends.protocol import (
     BackendProtocol,
     DeleteResult,
     EditResult,
+    FileData,
     FileDownloadResponse,
     FileInfo,
     FileUploadResponse,
-    GrepMatch,
+    GlobResult,
+    GrepResult,
+    LsResult,
+    ReadResult,
     WriteResult,
 )
 from deepagents.backends.utils import (
+    InvalidGlobPatternError,
     _copy_file_data_with_content,
     _get_backend_read_file_type,
     _glob_search_files,
     create_file_data,
     file_data_to_string,
-    format_read_response,
     grep_matches_from_files,
     perform_string_replacement,
+    slice_read_response,
     update_file_data,
 )
 
@@ -151,7 +156,7 @@ class StateBackend(BackendProtocol):
                 continue
 
             # This is a file directly in the current directory
-            size = len(file_data_to_string(fd))
+            size = len(file_data_to_string(fd).encode("utf-8"))
             infos.append(
                 {
                     "path": k,
@@ -165,15 +170,15 @@ class StateBackend(BackendProtocol):
         infos.extend(FileInfo(path=subdir, is_dir=True, size=0, modified_at="") for subdir in sorted(subdirs))
 
         infos.sort(key=lambda x: x.get("path", ""))
-        return infos
+        return LsResult(entries=infos)
 
     def read(
         self,
         file_path: str,
         offset: int = 0,
         limit: int = 2000,
-    ) -> str:
-        """Read file content with line numbers.
+    ) -> ReadResult:
+        """Read file content for the requested line range.
 
         Args:
             file_path: Absolute file path.
@@ -189,7 +194,7 @@ class StateBackend(BackendProtocol):
         file_data = files.get(file_path)
 
         if file_data is None:
-            return f"Error: File '{file_path}' not found"
+            return ReadResult(error=f"File '{file_path}' not found")
 
         if _get_backend_read_file_type(file_path) != "text":
             # Normalize legacy `list[str]` content to a string without mutating
@@ -211,6 +216,7 @@ class StateBackend(BackendProtocol):
 
         existing = files.get(file_path)
         new_file_data = update_file_data(existing, content) if existing is not None else create_file_data(content)
+        new_file_data["encoding"] = "utf-8"
         self._send_files_update({file_path: self._prepare_for_storage(new_file_data)})
         return WriteResult(path=file_path)
 
@@ -281,16 +287,29 @@ class StateBackend(BackendProtocol):
         return grep_matches_from_files(files, pattern, path if path is not None else "/", glob, max_count=max_count)
 
     def glob(self, pattern: str, path: str | None = None) -> GlobResult:
-        """Get `FileInfo` for files matching glob pattern."""
+        """Get `FileInfo` for files matching glob pattern.
+
+        Matching follows the shared backend contract -- see `BackendProtocol.glob`.
+        A bare pattern is basename-at-any-depth, so `*.py` matches nested files.
+        A refused pattern is returned as `GlobResult(error=...)`, not raised.
+        """
         files = self._read_files()
-        result = _glob_search_files(files, pattern, path)
+        try:
+            result = _glob_search_files(files, pattern, path)
+        except InvalidGlobPatternError as exc:
+            # `glob` is a tool boundary: report a refused pattern as a result
+            # rather than raising, matching FilesystemBackend and SandboxBackend.
+            # Catch the specific type -- a bare `ValueError` here would also
+            # capture path-normalization failures and mislabel them as pattern
+            # errors, sending the model off rewriting a glob that was fine.
+            return GlobResult(error=str(exc))
         if result == "No files found":
-            return []
+            return GlobResult(matches=[])
         paths = result.split("\n")
         infos: list[FileInfo] = []
         for p in paths:
             fd = files.get(p)
-            size = len(file_data_to_string(fd)) if fd else 0
+            size = len(file_data_to_string(fd).encode("utf-8")) if fd else 0
             infos.append(
                 {
                     "path": p,
@@ -299,7 +318,7 @@ class StateBackend(BackendProtocol):
                     "modified_at": fd.get("modified_at", "") if fd else "",
                 }
             )
-        return infos
+        return GlobResult(matches=infos)
 
     def upload_files(self, files: list[tuple[str, bytes]]) -> list[FileUploadResponse]:
         """Upload multiple files to state.
@@ -316,12 +335,13 @@ class StateBackend(BackendProtocol):
         for path, content in files:
             try:
                 text = content.decode("utf-8")
+                encoding = "utf-8"
             except UnicodeDecodeError:
                 text = base64.b64encode(content).decode("ascii")
+                encoding = "base64"
 
-            prev = existing.get(path)
-            file_data = update_file_data(prev, text) if prev else create_file_data(text)
-            update[path] = {**file_data}
+            created_at = (existing.get(path) or {}).get("created_at")
+            update[path] = {**create_file_data(text, created_at=created_at, encoding=encoding)}
             responses.append(FileUploadResponse(path=path, error=None))
 
         if update:
@@ -347,10 +367,10 @@ class StateBackend(BackendProtocol):
                 responses.append(FileDownloadResponse(path=path, content=None, error="file_not_found"))
                 continue
 
-            # Convert file data to bytes
             content_str = file_data_to_string(file_data)
-            content_bytes = content_str.encode("utf-8")
 
+            encoding = file_data.get("encoding", "utf-8")
+            content_bytes = content_str.encode("utf-8") if encoding == "utf-8" else base64.standard_b64decode(content_str)
             responses.append(FileDownloadResponse(path=path, content=content_bytes, error=None))
 
         return responses

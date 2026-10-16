@@ -2,11 +2,11 @@
 """Quick validation script for skills - minimal version.
 
 For deepagents CLI, skills are located at:
-~/.deepagents/<agent>/skills/<skill-name>/
+$DEEPAGENTS_HOME/<agent>/skills/<skill-name>/
 
 Example:
 ```python
-python quick_validate.py ~/.deepagents/agent/skills/my-skill
+python quick_validate.py "${DEEPAGENTS_HOME:-$HOME/.deepagents}/agent/skills/my-skill"
 ```
 """
 
@@ -32,7 +32,7 @@ def validate_skill(skill_path):
         return False, "SKILL.md not found"
 
     # Read and validate frontmatter
-    content = skill_md.read_text()
+    content = skill_md.read_text(encoding="utf-8")
     if not content.startswith("---"):
         return False, "No YAML frontmatter found"
 

@@ -1,5 +1,6 @@
 """Unit tests for LocalShellBackend."""
 
+import os
 import sys
 import tempfile
 import warnings
@@ -11,6 +12,36 @@ from deepagents.backends.local_shell import LocalShellBackend
 from deepagents.backends.protocol import ExecuteResponse
 
 pytestmark = pytest.mark.skipif(sys.platform == "win32", reason="LocalShellBackend requires sh, not available on Windows")
+
+
+def _execute_controlling_terminal_probe(directory: Path, result_file: Path) -> None:
+    """Run the backend probe after proving this process owns `/dev/tty`."""
+    descriptor = os.open("/dev/tty", os.O_RDONLY)
+    os.close(descriptor)
+    result = LocalShellBackend(root_dir=directory).execute(": </dev/tty")
+    result_file.write_text(f"{result.exit_code}\n{result.output}", encoding="utf-8")
+
+
+def _run_controlling_terminal_probe(directory: Path) -> tuple[int, str]:
+    """Run the backend inside a child that owns a real controlling terminal."""
+    pty = pytest.importorskip("pty")
+    result_file = directory / "tty-result"
+    child_id, terminal = pty.fork()
+    if child_id == 0:  # pragma: no cover - assertions run in the parent process
+        try:
+            _execute_controlling_terminal_probe(directory, result_file)
+        except BaseException as error:  # noqa: BLE001  # Report child setup failures to the parent.
+            result_file.write_text(f"harness error: {error}", encoding="utf-8")
+            os._exit(1)
+        os._exit(0)
+    try:
+        _, status = os.waitpid(child_id, 0)
+    finally:
+        os.close(terminal)
+    details = result_file.read_text(encoding="utf-8")
+    assert os.waitstatus_to_exitcode(status) == 0, details
+    exit_code, output = details.split("\n", 1)
+    return int(exit_code), output
 
 
 def test_local_shell_backend_initialization() -> None:
@@ -34,6 +65,13 @@ def test_local_shell_backend_execute_simple_command() -> None:
         assert result.exit_code == 0
         assert "Hello World" in result.output
         assert result.truncated is False
+
+
+def test_local_shell_backend_cannot_open_parent_controlling_terminal(tmp_path: Path) -> None:
+    """Test a command cannot open the controlling terminal owned by its parent."""
+    exit_code, output = _run_controlling_terminal_probe(tmp_path)
+    assert exit_code != 0
+    assert "/dev/tty" in output
 
 
 def test_local_shell_backend_execute_with_error() -> None:
@@ -112,8 +150,9 @@ def test_local_shell_backend_filesystem_operations() -> None:
 
         # Read the file
         content = backend.read("/test.txt")
-        assert "Hello" in content
-        assert "World" in content
+        assert content.file_data is not None
+        assert "Hello" in content.file_data["content"]
+        assert "World" in content.file_data["content"]
 
         # Edit the file
         edit_result = backend.edit("/test.txt", "World", "Universe")
@@ -122,8 +161,9 @@ def test_local_shell_backend_filesystem_operations() -> None:
 
         # Verify edit
         content = backend.read("/test.txt")
-        assert "Universe" in content
-        assert "World" not in content
+        assert content.file_data is not None
+        assert "Universe" in content.file_data["content"]
+        assert "World" not in content.file_data["content"]
 
 
 def test_local_shell_backend_integration_shell_and_filesystem() -> None:
@@ -146,7 +186,8 @@ def test_local_shell_backend_integration_shell_and_filesystem() -> None:
 
         # Read via filesystem
         content = backend.read("/shell_file.txt")
-        assert "Shell created" in content
+        assert content.file_data is not None
+        assert "Shell created" in content.file_data["content"]
 
 
 def test_local_shell_backend_ls_info() -> None:
@@ -159,8 +200,9 @@ def test_local_shell_backend_ls_info() -> None:
         backend.write("/file2.txt", "content2")
 
         # List files
-        files = backend.ls_info("/")
+        files = backend.ls("/").entries
 
+        assert files is not None
         assert len(files) == 2
         paths = [f["path"] for f in files]
         assert "/file1.txt" in paths
@@ -177,9 +219,9 @@ def test_local_shell_backend_grep() -> None:
         backend.write("/file2.txt", "DONE: completed")
 
         # Search for TODO
-        matches = backend.grep_raw("TODO")
+        matches = backend.grep("TODO").matches
 
-        assert isinstance(matches, list)
+        assert matches is not None
         assert len(matches) == 1
         assert matches[0]["text"] == "TODO: implement this"
 
@@ -195,8 +237,9 @@ def test_local_shell_backend_glob() -> None:
         backend.write("/file3.txt", "content")
 
         # Find all .txt files
-        txt_files = backend.glob_info("*.txt")
+        txt_files = backend.glob("*.txt").matches
 
+        assert txt_files is not None
         assert len(txt_files) == 2
         paths = [f["path"] for f in txt_files]
         assert "/file1.txt" in paths
@@ -292,7 +335,8 @@ async def test_local_shell_backend_async_filesystem_operations() -> None:
 
         # Async read
         content = await backend.aread("/async_test.txt")
-        assert "async content" in content
+        assert content.file_data is not None
+        assert "async content" in content.file_data["content"]
 
         # Async edit
         edit_result = await backend.aedit("/async_test.txt", "async", "modified")

@@ -38,7 +38,7 @@ on:
           - "terminal-bench/terminal-bench-2-1"
           - "sierra-research/tau3-bench"
           - "tau3-subset"
-          - "harbor-index/harbor-index-1.0"
+          - "harbor-index/harbor-index"
       dataset_override:
         description: "Override: arbitrary Harbor dataset ref (e.g. 'owner/dataset'). Takes priority over the dataset dropdown when non-empty."
         required: false
@@ -200,6 +200,7 @@ jobs:
   prep:
     name: "🔧 Prepare matrix"
     runs-on: ubuntu-latest
+    environment: evals
     outputs:
       # The single resolved model spec (this workflow accepts exactly one model).
       model: ${{ steps.extract-model.outputs.model }}
@@ -225,7 +226,7 @@ jobs:
           ROLLOUTS_PER_TASK: ${{ inputs.rollouts_per_task }}
           CONCURRENCY: ${{ inputs.concurrency }}
         run: |
-          echo "### ⚓ Harbor dispatch inputs" >> "$GITHUB_STEP_SUMMARY"
+          echo "### 📊 Evals - Harbor dispatch inputs" >> "$GITHUB_STEP_SUMMARY"
           echo "" >> "$GITHUB_STEP_SUMMARY"
           echo "| Input | Value |" >> "$GITHUB_STEP_SUMMARY"
           echo "|---|---|" >> "$GITHUB_STEP_SUMMARY"
@@ -252,11 +253,11 @@ jobs:
           echo "" >> "$GITHUB_STEP_SUMMARY"
 
       - name: "📋 Checkout Code"
-        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
       - name: "🐍 Compute Harbor matrix"
         id: set-matrix
-        run: python .github/scripts/models.py harbor
+        run: python .github/scripts/evals/models.py harbor
         env:
           HARBOR_MODELS: ${{ inputs.models_override || inputs.models || 'fireworks:accounts/fireworks/models/glm-5p2' }}
 
@@ -276,7 +277,7 @@ jobs:
           CONCURRENCY: ${{ inputs.concurrency || '4' }}
           ROLLOUTS: ${{ inputs.rollouts_per_task }}
           MODEL_MATRIX: ${{ steps.set-matrix.outputs.matrix }}
-        run: python .github/scripts/validate_harbor_limits.py
+        run: python .github/scripts/evals/validate_harbor_limits.py
 
       - name: "🎯 Extract single model"
         id: extract-model

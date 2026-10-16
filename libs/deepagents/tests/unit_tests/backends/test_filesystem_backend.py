@@ -2,6 +2,7 @@ import base64
 import io
 import json
 import logging
+import os
 import shutil
 import subprocess
 import sys
@@ -19,6 +20,31 @@ from deepagents.backends.filesystem import FilesystemBackend
 from deepagents.backends.protocol import DeleteResult, EditResult, GrepMatch, ReadResult, WriteResult
 from deepagents.backends.utils import format_grep_matches
 from deepagents.middleware.filesystem import GLOB_TIMEOUT, FilesystemMiddleware
+
+
+def require_ripgrep() -> None:
+    """Skip when ripgrep is absent, or fail when the runner promised it.
+
+    CI installs ripgrep and exports `DEEPAGENTS_RIPGREP_EXPECTED=1` on every
+    runner where the install is required to have succeeded. On those runners a
+    missing `rg` means the install silently regressed, so the tests below must
+    fail rather than skip: they are the only coverage of the *real binary*
+    contract (the rest of the ripgrep tests patch `subprocess.Popen`), and one
+    of them guards symlink containment. A skip would let a containment
+    regression merge with a green build.
+
+    Locally, and on runners where the install was allowed to fail, a missing
+    `rg` is expected and still skips. CI allows the failure in two cases: the
+    bounded install on an ordinary PR hit its two-minute timeout, or the
+    unbounded strict install on a release PR failed and was bypassed under the
+    `ci:skip-ripgrep` label.
+    """
+    if shutil.which("rg") is not None:
+        return
+    if os.environ.get("DEEPAGENTS_RIPGREP_EXPECTED") == "1":
+        msg = "CI installed ripgrep on this runner but `rg` is not on PATH"
+        pytest.fail(msg)
+    pytest.skip("ripgrep not installed")
 
 
 def write_file(p: Path, content: str):
@@ -43,26 +69,28 @@ def test_filesystem_backend_normal_mode(tmp_path: Path):
     be = FilesystemBackend(root_dir=str(root), virtual_mode=False)
 
     # ls_info absolute path - should only list files in root, not subdirectories
-    infos = be.ls_info(str(root))
+    infos = be.ls(str(root)).entries
+    assert infos is not None
     paths = {i["path"] for i in infos}
     assert str(f1) in paths  # File in root should be listed
     assert str(f2) not in paths  # File in subdirectory should NOT be listed
     assert (str(root / "dir") + "/") in paths  # Directory should be listed
 
     # read, edit, write
-    txt = be.read(str(f1))
-    assert "hello fs" in txt
+    read_result = be.read(str(f1))
+    assert isinstance(read_result, ReadResult) and read_result.file_data is not None
+    assert "hello fs" in read_result.file_data["content"]
     msg = be.edit(str(f1), "fs", "filesystem", replace_all=False)
     assert isinstance(msg, EditResult) and msg.error is None and msg.occurrences == 1
     msg2 = be.write(str(root / "new.txt"), "new content")
     assert isinstance(msg2, WriteResult) and msg2.error is None and msg2.path.endswith("new.txt")
 
-    # grep_raw
-    matches = be.grep_raw("hello", path=str(root))
-    assert isinstance(matches, list) and any(m["path"].endswith("a.txt") for m in matches)
+    # grep
+    matches = be.grep("hello", path=str(root)).matches
+    assert matches is not None and any(m["path"].endswith("a.txt") for m in matches)
 
-    # glob_info
-    g = be.glob_info("*.py", path=str(root))
+    # glob
+    g = be.glob("*.py", path=str(root)).matches
     assert any(i["path"] == str(f2) for i in g)
 
 
@@ -85,21 +113,35 @@ def test_filesystem_backend_glob_default_matches_backend_root(tmp_path: Path) ->
     assert str(outside_root) not in omitted_paths
 
 
-def test_filesystem_backend_glob_matches_hidden_paths(tmp_path: Path) -> None:
+def test_filesystem_backend_glob_hidden_paths_require_explicit_dot_patterns(tmp_path: Path) -> None:
+    """Leading-dot names are not matched by bare `*` (shared grep include contract).
+
+    Hidden files remain reachable with explicit dot patterns (`.*`, `.github/**`).
+    This mirrors `compile_grep_include_glob` / bash without `dotglob`, not
+    pathlib `rglob` which does surface dotfiles under `*`.
+    """
     root = tmp_path
     write_file(root / ".env", "TOKEN=value")
     write_file(root / ".hidden.py", "print('hidden')")
+    write_file(root / "visible.py", "print('visible')")
     write_file(root / ".github" / "workflows" / "ci.yml", "name: ci")
 
     be = FilesystemBackend(root_dir=str(root), virtual_mode=True)
 
-    root_matches = {info["path"] for info in be.glob("*", path="/").matches or []}
-    py_matches = {info["path"] for info in be.glob("*.py", path="/").matches or []}
-    yml_matches = {info["path"] for info in be.glob("**/*.yml", path="/").matches or []}
+    bare_root = {info["path"] for info in be.glob("*", path="/").matches or []}
+    bare_py = {info["path"] for info in be.glob("*.py", path="/").matches or []}
+    bare_yml = {info["path"] for info in be.glob("**/*.yml", path="/").matches or []}
+    assert "/.env" not in bare_root
+    assert "/.hidden.py" not in bare_py
+    assert "/visible.py" in bare_py
+    assert "/.github/workflows/ci.yml" not in bare_yml
 
-    assert "/.env" in root_matches
-    assert "/.hidden.py" in py_matches
-    assert "/.github/workflows/ci.yml" in yml_matches
+    explicit_dot = {info["path"] for info in be.glob(".*", path="/").matches or []}
+    explicit_py = {info["path"] for info in be.glob(".*.py", path="/").matches or []}
+    explicit_yml = {info["path"] for info in be.glob(".github/**/*.yml", path="/").matches or []}
+    assert "/.env" in explicit_dot
+    assert "/.hidden.py" in explicit_py
+    assert "/.github/workflows/ci.yml" in explicit_yml
 
 
 def test_filesystem_backend_virtual_mode(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
@@ -114,15 +156,17 @@ def test_filesystem_backend_virtual_mode(tmp_path: Path, monkeypatch: pytest.Mon
     be = FilesystemBackend(root_dir=str(root), virtual_mode=True)
 
     # ls_info from virtual root - should only list files in root, not subdirectories
-    infos = be.ls_info("/")
+    infos = be.ls("/").entries
+    assert infos is not None
     paths = {i["path"] for i in infos}
     assert "/a.txt" in paths  # File in root should be listed
     assert "/dir/b.md" not in paths  # File in subdirectory should NOT be listed
     assert "/dir/" in paths  # Directory should be listed
 
     # read and edit via virtual path
-    txt = be.read("/a.txt")
-    assert "hello virtual" in txt
+    read_result = be.read("/a.txt")
+    assert isinstance(read_result, ReadResult) and read_result.file_data is not None
+    assert "hello virtual" in read_result.file_data["content"]
     msg = be.edit("/a.txt", "virtual", "virt", replace_all=False)
     assert isinstance(msg, EditResult) and msg.error is None and msg.occurrences == 1
 
@@ -131,17 +175,17 @@ def test_filesystem_backend_virtual_mode(tmp_path: Path, monkeypatch: pytest.Mon
     assert isinstance(msg2, WriteResult) and msg2.error is None
     assert (root / "new.txt").exists()
 
-    # grep_raw limited to path
-    matches = be.grep_raw("virt", path="/")
-    assert isinstance(matches, list) and any(m["path"] == "/a.txt" for m in matches)
+    # grep limited to path
+    matches = be.grep("virt", path="/").matches
+    assert matches is not None and any(m["path"] == "/a.txt" for m in matches)
 
-    # glob_info
-    g = be.glob_info("**/*.md", path="/")
+    # glob
+    g = be.glob("**/*.md", path="/").matches
     assert any(i["path"] == "/dir/b.md" for i in g)
 
     # literal search should work with special regex chars like "[" and "("
-    matches_bracket = be.grep_raw("[", path="/")
-    assert isinstance(matches_bracket, list)  # Should not error, returns empty list or matches
+    result_bracket = be.grep("[", path="/")
+    assert result_bracket.matches is not None  # Should not error, returns empty list or matches
 
     # path traversal blocked
     with pytest.raises(ValueError, match="traversal"):
@@ -165,7 +209,8 @@ def test_filesystem_backend_ls_nested_directories(tmp_path: Path):
 
     be = FilesystemBackend(root_dir=str(root), virtual_mode=True)
 
-    root_listing = be.ls_info("/")
+    root_listing = be.ls("/").entries
+    assert root_listing is not None
     root_paths = [fi["path"] for fi in root_listing]
     assert "/config.json" in root_paths
     assert "/src/" in root_paths
@@ -173,13 +218,15 @@ def test_filesystem_backend_ls_nested_directories(tmp_path: Path):
     assert "/src/main.py" not in root_paths
     assert "/src/utils/helper.py" not in root_paths
 
-    src_listing = be.ls_info("/src/")
+    src_listing = be.ls("/src/").entries
+    assert src_listing is not None
     src_paths = [fi["path"] for fi in src_listing]
     assert "/src/main.py" in src_paths
     assert "/src/utils/" in src_paths
     assert "/src/utils/helper.py" not in src_paths
 
-    utils_listing = be.ls_info("/src/utils/")
+    utils_listing = be.ls("/src/utils/").entries
+    assert utils_listing is not None
     utils_paths = [fi["path"] for fi in utils_listing]
     assert "/src/utils/helper.py" in utils_paths
     assert "/src/utils/common.py" in utils_paths
@@ -205,14 +252,16 @@ def test_filesystem_backend_ls_normal_mode_nested(tmp_path: Path):
 
     be = FilesystemBackend(root_dir=str(root), virtual_mode=False)
 
-    root_listing = be.ls_info(str(root))
+    root_listing = be.ls(str(root)).entries
+    assert root_listing is not None
     root_paths = [fi["path"] for fi in root_listing]
 
     assert str(root / "file1.txt") in root_paths
     assert str(root / "subdir") + "/" in root_paths
     assert str(root / "subdir" / "file2.txt") not in root_paths
 
-    subdir_listing = be.ls_info(str(root / "subdir"))
+    subdir_listing = be.ls(str(root / "subdir")).entries
+    assert subdir_listing is not None
     subdir_paths = [fi["path"] for fi in subdir_listing]
     assert str(root / "subdir" / "file2.txt") in subdir_paths
     assert str(root / "subdir" / "nested") + "/" in subdir_paths
@@ -233,15 +282,19 @@ def test_filesystem_backend_ls_trailing_slash(tmp_path: Path):
 
     be = FilesystemBackend(root_dir=str(root), virtual_mode=True)
 
-    listing_with_slash = be.ls_info("/")
+    listing_with_slash = be.ls("/").entries
+    assert listing_with_slash is not None
     assert len(listing_with_slash) > 0
 
-    listing = be.ls_info("/")
+    listing = be.ls("/").entries
+    assert listing is not None
     paths = [fi["path"] for fi in listing]
     assert paths == sorted(paths)
 
-    listing1 = be.ls_info("/dir/")
-    listing2 = be.ls_info("/dir")
+    listing1 = be.ls("/dir/").entries
+    listing2 = be.ls("/dir").entries
+    assert listing1 is not None
+    assert listing2 is not None
     assert len(listing1) == len(listing2)
     assert [fi["path"] for fi in listing1] == [fi["path"] for fi in listing2]
 
@@ -315,6 +368,67 @@ def test_filesystem_backend_read_empty_file_leaves_pagination_unset(tmp_path: Pa
     assert result.start_line is None
     assert result.end_line is None
     assert result.next_offset is None
+
+
+@pytest.mark.parametrize("limit", [0, -3])
+def test_filesystem_backend_read_non_positive_limit_returns_empty_read(tmp_path: Path, limit: int) -> None:
+    """A degenerate `limit` returns an empty read, not a line-range error."""
+    target = tmp_path / "notes.txt"
+    target.write_text("one\ntwo\nthree\n")
+    be = FilesystemBackend(root_dir=str(tmp_path), virtual_mode=False)
+
+    result = be.read(str(target), offset=0, limit=limit)
+
+    assert result.error is None
+    assert result.file_data is not None
+    assert result.file_data["content"] == ""
+    assert result.total_lines is None
+    assert result.start_line is None
+    assert result.end_line is None
+    assert result.next_offset is None
+
+
+def test_filesystem_backend_read_negative_offset_starts_at_first_line(tmp_path: Path) -> None:
+    """A negative offset is clamped to the start of the file instead of erroring."""
+    target = tmp_path / "notes.txt"
+    target.write_text("one\ntwo\nthree\n")
+    be = FilesystemBackend(root_dir=str(tmp_path), virtual_mode=False)
+
+    result = be.read(str(target), offset=-1, limit=2)
+
+    assert result.error is None
+    assert result.file_data is not None
+    assert result.file_data["content"] == "one\ntwo\n"
+    assert result.start_line == 1
+    assert result.end_line == 2
+    assert result.next_offset == 2
+
+
+def test_filesystem_backend_read_zero_limit_on_empty_file_reports_empty_file(tmp_path: Path) -> None:
+    """The empty-file check precedes the slice, so the reminder wins over the limit."""
+    target = tmp_path / "blank.txt"
+    target.write_text("")
+    be = FilesystemBackend(root_dir=str(tmp_path), virtual_mode=False)
+
+    result = be.read(str(target), offset=0, limit=0)
+
+    assert result.error is None
+    assert result.file_data is not None
+    assert "empty contents" in result.file_data["content"]
+
+
+def test_filesystem_backend_read_zero_limit_on_binary_returns_full_payload(tmp_path: Path) -> None:
+    """`limit` does not apply to binary reads, so a zero limit is not an empty read."""
+    target = tmp_path / "clip.png"
+    target.write_bytes(b"\x89PNG\r\n\x1a\n" + b"\x00" * 32)
+    be = FilesystemBackend(root_dir=str(tmp_path), virtual_mode=False)
+
+    result = be.read(str(target), offset=0, limit=0)
+
+    assert result.error is None
+    assert result.file_data is not None
+    assert result.file_data["encoding"] == "base64"
+    assert result.file_data["content"] != ""
 
 
 def test_filesystem_backend_reads_mkv_as_binary(tmp_path: Path) -> None:
@@ -675,8 +789,8 @@ def test_grep_literal_search_with_special_chars(tmp_path: Path, pattern: str, ex
     be = FilesystemBackend(root_dir=str(root), virtual_mode=True)
 
     # Test literal search with the pattern (uses ripgrep if available, otherwise Python fallback)
-    matches = be.grep_raw(pattern, path="/")
-    assert isinstance(matches, list)
+    matches = be.grep(pattern, path="/").matches
+    assert matches is not None
     assert any(expected_file in m["path"] for m in matches), f"Pattern '{pattern}' not found in {expected_file}"
 
 
@@ -686,8 +800,7 @@ def test_grep_ripgrep_glob_with_directory_component(tmp_path: Path, monkeypatch:
     ripgrep `--glob` patterns with a directory component (e.g. `docs/*.md`)
     must still match when the process cwd differs from the search root.
     """
-    if shutil.which("rg") is None:
-        pytest.skip("ripgrep not installed")
+    require_ripgrep()
 
     root = tmp_path / "project"
     (root / "docs").mkdir(parents=True)
@@ -713,8 +826,7 @@ def test_grep_ripgrep_glob_virtual_mode(tmp_path: Path, monkeypatch: pytest.Monk
     Exercises the relative-path re-anchoring through `_to_virtual_path` so a
     regression in path handling can't silently drop results.
     """
-    if shutil.which("rg") is None:
-        pytest.skip("ripgrep not installed")
+    require_ripgrep()
 
     root = tmp_path / "project"
     (root / "docs").mkdir(parents=True)
@@ -740,8 +852,7 @@ def test_grep_on_single_file_path(tmp_path: Path) -> None:
     Before #2732's fix, ripgrep was given the file path directly. Naively
     threading `cwd=base_full` would raise NotADirectoryError for file paths.
     """
-    if shutil.which("rg") is None:
-        pytest.skip("ripgrep not installed")
+    require_ripgrep()
 
     target = tmp_path / "single.txt"
     target.write_text("hello single\n")
@@ -761,8 +872,7 @@ def test_grep_preserves_symlink_path_in_results(tmp_path: Path, monkeypatch: pyt
     `.resolve()` was applied — so users saw the symlinked path they searched
     under. The fix must preserve that behavior.
     """
-    if shutil.which("rg") is None:
-        pytest.skip("ripgrep not installed")
+    require_ripgrep()
 
     real = tmp_path / "real"
     real.mkdir()
@@ -796,8 +906,7 @@ def test_grep_containment_check_blocks_escaping_symlink(tmp_path: Path, monkeypa
     access to files beyond the intended search boundary. The containment check
     must drop those results so they never surface to callers.
     """
-    if shutil.which("rg") is None:
-        pytest.skip("ripgrep not installed")
+    require_ripgrep()
 
     outside = tmp_path / "outside"
     outside.mkdir()
@@ -1519,25 +1628,26 @@ class TestWindowsPathHandling:
         (tmp_path / "src" / "utils" / "helper.py").write_text("def help(): pass")
         return FilesystemBackend(root_dir=str(tmp_path), virtual_mode=True)
 
-    def test_ls_info_paths(self, backend):
-        """ls_info should return forward-slash paths."""
-        infos = backend.ls_info("/src")
+    def test_ls_paths(self, backend):
+        """Ls should return forward-slash paths."""
+        infos = backend.ls("/src").entries
+        assert infos is not None
         for info in infos:
-            assert "\\" not in info["path"], f"Backslash in ls_info path: {info['path']}"
+            assert "\\" not in info["path"], f"Backslash in ls path: {info['path']}"
 
-    def test_glob_info_paths(self, backend):
-        """glob_info should return forward-slash paths."""
-        result = backend.glob_info("**/*.py", path="/")
-        assert isinstance(result, list)
-        for info in result:
-            assert "\\" not in info["path"], f"Backslash in glob_info path: {info['path']}"
+    def test_glob_paths(self, backend):
+        """Glob should return forward-slash paths."""
+        result = backend.glob("**/*.py", path="/")
+        assert result.matches is not None
+        for info in result.matches:
+            assert "\\" not in info["path"], f"Backslash in glob path: {info['path']}"
 
-    def test_grep_raw_paths(self, backend):
-        """grep_raw should return forward-slash paths."""
-        matches = backend.grep_raw("def", path="/")
-        assert isinstance(matches, list)
+    def test_grep_paths(self, backend):
+        """Grep should return forward-slash paths."""
+        matches = backend.grep("def", path="/").matches
+        assert matches is not None
         for m in matches:
-            assert "\\" not in m["path"], f"Backslash in grep_raw path: {m['path']}"
+            assert "\\" not in m["path"], f"Backslash in grep path: {m['path']}"
 
     def test_deeply_nested_path(self, tmp_path: Path):
         """Deeply nested paths should still use forward slashes."""
@@ -1545,7 +1655,8 @@ class TestWindowsPathHandling:
         deep.mkdir(parents=True)
         (deep / "file.txt").write_text("content")
         be = FilesystemBackend(root_dir=str(tmp_path), virtual_mode=True)
-        infos = be.ls_info("/a/b/c/d")
+        infos = be.ls("/a/b/c/d").entries
+        assert infos is not None
         for info in infos:
             assert "\\" not in info["path"], f"Backslash in deep path: {info['path']}"
 
@@ -1812,6 +1923,29 @@ class TestGrepPythonFallbackTimeout:
         results, _truncated, partial_error = be._python_search("hit", tmp_path, None)
         assert partial_error is None
         assert results.get("/cr.txt") == [(1, "hit me")]
+
+    def test_grep_returns_error_for_refused_include_glob(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """A `..` include glob becomes `GrepResult.error`, never a raise.
+
+        The shared matcher raises `InvalidGlobPatternError` on traversal and the
+        Python fallback compiles the glob outside any error handling, so `grep`
+        validates the glob before choosing a search path. The check holds with
+        and without ripgrep.
+        """
+        (tmp_path / "f.txt").write_text("needle\n")
+        be = FilesystemBackend(root_dir=str(tmp_path), virtual_mode=True)
+        monkeypatch.setattr(be, "_ripgrep_search", lambda *_args, **_kwargs: (None, False))
+        for forced_fallback in (True, False):
+            if not forced_fallback:
+                monkeypatch.undo()
+            result = be.grep("needle", path="/", glob="../*.py")
+            assert result.matches == []
+            assert result.error is not None
+            assert "Path traversal" in result.error
 
     def test_grep_fallback_treats_pattern_literally(
         self,
@@ -2460,6 +2594,18 @@ class TestReadTrailingNewlineRoundtrip:
         assert "old_string ends with a newline" in result.error
         assert target.read_text() == "# Agent Role:\nyou are an assistant"
 
+    def test_edit_empty_old_string_leaves_file_unchanged(self, tmp_path: Path) -> None:
+        """Empty `old_string` must error and never modify the file on disk."""
+        target = tmp_path / "a.txt"
+        target.write_text("hello world")
+
+        be = FilesystemBackend(root_dir=str(tmp_path), virtual_mode=False)
+        result = be.edit(str(target), "", "x", replace_all=True)
+
+        assert result.error is not None
+        assert "old_string cannot be empty" in result.error
+        assert target.read_text() == "hello world"
+
 
 class TestFilesystemDelete:
     """Tests for FilesystemBackend.delete."""
@@ -2575,3 +2721,55 @@ class TestFilesystemDelete:
         assert result.error is not None
         assert "Error deleting" in result.error
         assert f.exists()
+
+
+class TestRealPath:
+    """`FilesystemBackend._real_path`, used by filesystem permissions."""
+
+    def _backend(self, tmp_path: Path) -> FilesystemBackend:
+        (tmp_path / "secrets").mkdir()
+        write_file(tmp_path / "secrets" / "key.txt", "k")
+        return FilesystemBackend(root_dir=str(tmp_path), virtual_mode=True)
+
+    def test_plain_and_missing_paths_unchanged(self, tmp_path: Path) -> None:
+        real_path = self._backend(tmp_path)._real_path
+        assert real_path("/secrets/key.txt") == "/secrets/key.txt"
+        assert real_path("/secrets/new/file.txt") == "/secrets/new/file.txt"
+        assert real_path("/") == "/"
+
+    def test_follows_directory_leaf_and_dangling_symlinks(self, tmp_path: Path) -> None:
+        backend = self._backend(tmp_path)
+        try:
+            (tmp_path / "link").symlink_to(tmp_path / "secrets", target_is_directory=True)
+            (tmp_path / "alias.txt").symlink_to(tmp_path / "secrets" / "key.txt")
+            (tmp_path / "dangling").symlink_to(tmp_path / "secrets" / "future")
+        except (NotImplementedError, OSError):
+            pytest.skip("platform does not support symlinks")
+        real_path = backend._real_path
+        assert real_path("/link/key.txt") == "/secrets/key.txt"
+        assert real_path("/link/missing.txt") == "/secrets/missing.txt"
+        assert real_path("/alias.txt") == "/secrets/key.txt"
+        assert real_path("/dangling/x.txt") == "/secrets/future/x.txt"
+
+    def test_escape_outside_root_raises(self, tmp_path: Path) -> None:
+        outside = tmp_path / "outside"
+        outside.mkdir()
+        root = tmp_path / "root"
+        root.mkdir()
+        try:
+            (root / "escape").symlink_to(outside, target_is_directory=True)
+        except (NotImplementedError, OSError):
+            pytest.skip("platform does not support symlinks")
+        real_path = FilesystemBackend(root_dir=str(root), virtual_mode=True)._real_path
+        with pytest.raises(ValueError, match="outside root"):
+            real_path("/escape/x")
+
+    def test_non_virtual_mode_returns_real_path(self, tmp_path: Path) -> None:
+        self._backend(tmp_path)
+        try:
+            (tmp_path / "link").symlink_to(tmp_path / "secrets", target_is_directory=True)
+        except (NotImplementedError, OSError):
+            pytest.skip("platform does not support symlinks")
+        real_path = FilesystemBackend(root_dir=str(tmp_path), virtual_mode=False)._real_path
+        expected = Path(os.path.realpath(tmp_path / "secrets" / "key.txt"))
+        assert real_path(str(tmp_path / "link" / "key.txt")) == "/" + expected.relative_to(expected.anchor).as_posix()

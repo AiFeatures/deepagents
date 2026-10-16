@@ -7,65 +7,6 @@ from collections.abc import Mapping
 
 from langchain.chat_models import init_chat_model
 from langchain_core.language_models import BaseChatModel
-from packaging.version import Version
-
-OPENROUTER_MIN_VERSION = "0.2.0"
-"""Minimum required version of `langchain-openrouter`.
-
-Used by both the SDK (`resolve_model`) and the CLI (`config.py`) to enforce
-a consistent version floor at runtime.
-"""
-
-_OPENROUTER_APP_URL = "https://github.com/langchain-ai/deepagents"
-"""Default `app_url` (maps to `HTTP-Referer`) for OpenRouter attribution.
-
-See https://openrouter.ai/docs/app-attribution for details.
-"""
-
-_OPENROUTER_APP_TITLE = "Deep Agents"
-"""Default `app_title` (maps to `X-Title`) for OpenRouter attribution."""
-
-
-def _openrouter_attribution_kwargs() -> dict[str, Any]:
-    """Build OpenRouter attribution kwargs, deferring to env var overrides.
-
-    `ChatOpenRouter` reads `OPENROUTER_APP_URL` and `OPENROUTER_APP_TITLE` via
-    `from_env()` defaults. Explicit kwargs passed to the constructor take
-    precedence over those env-var defaults, so we only inject our SDK defaults
-    when the corresponding env var is **not** set — otherwise the user's env var
-    would be overridden.
-
-    Returns:
-        Dictionary of attribution kwargs to spread into `init_chat_model`.
-    """
-    kwargs: dict[str, Any] = {}
-    if not os.environ.get("OPENROUTER_APP_URL"):
-        kwargs["app_url"] = _OPENROUTER_APP_URL
-    if not os.environ.get("OPENROUTER_APP_TITLE"):
-        kwargs["app_title"] = _OPENROUTER_APP_TITLE
-    return kwargs
-
-
-def check_openrouter_version() -> None:
-    """Raise if the installed `langchain-openrouter` is below the minimum.
-
-    If the package is not installed at all the check is skipped;
-    `init_chat_model` will surface its own missing-dependency error downstream.
-
-    Raises:
-        ImportError: If the installed version is too old.
-    """
-    try:
-        installed = pkg_version("langchain-openrouter")
-    except PackageNotFoundError:
-        return
-    if Version(installed) < Version(OPENROUTER_MIN_VERSION):
-        msg = (
-            f"deepagents requires langchain-openrouter>={OPENROUTER_MIN_VERSION}, "
-            f"but {installed} is installed. "
-            f"Run: pip install 'langchain-openrouter>={OPENROUTER_MIN_VERSION}'"
-        )
-        raise ImportError(msg)
 
 from deepagents.profiles.provider.provider_profiles import apply_provider_profile
 
@@ -212,7 +153,8 @@ def model_matches_spec(model: BaseChatModel, spec: str) -> bool:
     Provider comparison is normalized, so case, hyphen/underscore spelling, and
     known aliases do not read as a mismatch (see `_normalize_provider`).
 
-    Assumes the `provider:model` convention (single colon separator).
+    Assumes the `provider:model` convention, where the first colon is the
+    separator and the model identifier may contain additional colons.
 
     Args:
         model: Chat model instance to inspect.

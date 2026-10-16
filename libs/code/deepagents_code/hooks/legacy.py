@@ -1,5 +1,11 @@
 """Lightweight hook dispatch for external tool integration.
 
+DEPRECATED: This is the legacy hook system, kept for backward compatibility
+until September 1, 2026. New integrations should use Hooks v2 — see
+`deepagents_code.hooks.loading` for config locations and
+`deepagents_code.hooks.models` for the schema. Legacy documents are migrated
+to v2 at load time (`deepagents_code.hooks.migration`).
+
 Loads hook configuration from `~/.deepagents/hooks.json` and fires matching
 commands with JSON payloads on stdin. Subprocess work is offloaded to a
 background thread so the caller's event loop is never stalled. Failures are
@@ -140,7 +146,7 @@ def _load_hooks() -> list[dict[str, Any]]:
         return _hooks_config
 
     try:
-        data = json.loads(hooks_path.read_text())
+        data = json.loads(hooks_path.read_text(encoding="utf-8"))
         if not isinstance(data, dict):
             logger.warning(
                 "Hooks config at %s must be a JSON object, got %s",
@@ -159,7 +165,7 @@ def _load_hooks() -> list[dict[str, Any]]:
             _hooks_config = []
             return _hooks_config
         _hooks_config = hooks
-    except (json.JSONDecodeError, OSError) as exc:
+    except (UnicodeDecodeError, json.JSONDecodeError, OSError) as exc:
         logger.warning("Failed to load hooks config from %s: %s", hooks_path, exc)
         _hooks_config = []
 

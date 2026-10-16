@@ -12,11 +12,12 @@ deepagents.middleware.skills.SkillsMiddleware directly.
 from __future__ import annotations
 
 import logging
-from typing import TYPE_CHECKING, cast
+from typing import TYPE_CHECKING, Literal, cast
 
 from deepagents.backends.filesystem import FilesystemBackend
 
 if TYPE_CHECKING:
+    from collections.abc import Sequence
     from pathlib import Path
 from deepagents.middleware.skills import (
     SkillMetadata,
@@ -33,14 +34,15 @@ class ExtendedSkillMetadata(SkillMetadata):
     """Extended skill metadata for CLI display, adds source tracking.
 
     Attributes:
-        source: Origin of the skill. One of `'built-in'`, `'user'`, or `'project'`.
+        source: Origin of the skill. One of `'built-in'`, `'user'`, `'project'`,
+            or `'claude (experimental)'`.
     """
 
     source: Literal["built-in", "plugin", "user", "project", "claude (experimental)"]
 
 
 # Re-export for CLI commands
-__all__ = ["SkillMetadata", "list_skills"]
+__all__ = ["SkillMetadata", "list_skills", "load_skill_content"]
 
 
 def list_skills(
@@ -51,6 +53,8 @@ def list_skills(
     project_skills_dir: Path | None = None,
     user_agent_skills_dir: Path | None = None,
     project_agent_skills_dir: Path | None = None,
+    user_claude_skills_dir: Path | None = None,
+    project_claude_skills_dir: Path | None = None,
 ) -> list[ExtendedSkillMetadata]:
     """List skills from built-in, user, and/or project directories.
 
@@ -76,6 +80,8 @@ def list_skills(
         project_skills_dir: Path to `.deepagents/skills/`.
         user_agent_skills_dir: Path to `~/.agents/skills/` (alias).
         project_agent_skills_dir: Path to `.agents/skills/` (alias).
+        user_claude_skills_dir: Path to `~/.claude/skills/` (experimental).
+        project_claude_skills_dir: Path to `.claude/skills/` (experimental).
 
     Returns:
         Merged list of skill metadata from all sources, with higher-precedence
@@ -124,7 +130,7 @@ def list_skills(
             else:
                 skills = list_skills_from_backend(backend=backend, source_path=".")
             if experimental and skills:
-                logger.info(
+                logger.debug(
                     "Discovered %d skill(s) from experimental Claude path: %s",
                     len(skills),
                     skill_dir,
@@ -149,90 +155,8 @@ def list_skills(
             # WARNING (not ERROR) because a half-written SKILL.md from a user is
             # an expected condition, not a code defect.
             logger.warning(
-                "Could not load built-in skills from %s",
-                built_in_skills_dir,
-                exc_info=True,
-            )
-
-    # 1. User deepagents skills (~/.deepagents/{agent}/skills/)
-    if user_skills_dir and user_skills_dir.exists():
-        try:
-            user_backend = FilesystemBackend(root_dir=str(user_skills_dir))
-            user_skills = list_skills_from_backend(
-                backend=user_backend, source_path="."
-            )
-            for skill in user_skills:
-                # cast(): type checkers can't infer TypedDict from spread syntax
-                extended_skill = cast(
-                    "ExtendedSkillMetadata", {**skill, "source": "user"}
-                )
-                all_skills[skill["name"]] = extended_skill
-        except OSError:
-            logger.warning(
-                "Could not load user skills from %s",
-                user_skills_dir,
-                exc_info=True,
-            )
-
-    # 2. User agent skills (~/.agents/skills/) - overrides user deepagents
-    if user_agent_skills_dir and user_agent_skills_dir.exists():
-        try:
-            user_agent_backend = FilesystemBackend(root_dir=str(user_agent_skills_dir))
-            user_agent_skills = list_skills_from_backend(
-                backend=user_agent_backend, source_path="."
-            )
-            for skill in user_agent_skills:
-                # cast(): type checkers can't infer TypedDict from spread syntax
-                extended_skill = cast(
-                    "ExtendedSkillMetadata", {**skill, "source": "user"}
-                )
-                all_skills[skill["name"]] = extended_skill
-        except OSError:
-            logger.warning(
-                "Could not load user agent skills from %s",
-                user_agent_skills_dir,
-                exc_info=True,
-            )
-
-    # 3. Project deepagents skills (.deepagents/skills/)
-    if project_skills_dir and project_skills_dir.exists():
-        try:
-            project_backend = FilesystemBackend(root_dir=str(project_skills_dir))
-            project_skills = list_skills_from_backend(
-                backend=project_backend, source_path="."
-            )
-            for skill in project_skills:
-                # cast(): type checkers can't infer TypedDict from spread syntax
-                extended_skill = cast(
-                    "ExtendedSkillMetadata", {**skill, "source": "project"}
-                )
-                all_skills[skill["name"]] = extended_skill
-        except OSError:
-            logger.warning(
-                "Could not load project skills from %s",
-                project_skills_dir,
-                exc_info=True,
-            )
-
-    # 4. Project agent skills (.agents/skills/) - highest priority
-    if project_agent_skills_dir and project_agent_skills_dir.exists():
-        try:
-            project_agent_backend = FilesystemBackend(
-                root_dir=str(project_agent_skills_dir)
-            )
-            project_agent_skills = list_skills_from_backend(
-                backend=project_agent_backend, source_path="."
-            )
-            for skill in project_agent_skills:
-                # cast(): type checkers can't infer TypedDict from spread syntax
-                extended_skill = cast(
-                    "ExtendedSkillMetadata", {**skill, "source": "project"}
-                )
-                all_skills[skill["name"]] = extended_skill
-        except OSError:
-            logger.warning(
-                "Could not load project agent skills from %s",
-                project_agent_skills_dir,
+                "Could not load skills from %s",
+                skill_dir,
                 exc_info=True,
             )
 
@@ -280,12 +204,13 @@ def load_skill_content(
             skill_path,
         )
         from deepagents_code._env_vars import EXTRA_SKILLS_DIRS
+        from deepagents_code._paths import PATHS
 
         msg = (
             f"Skill path {skill_path} resolves outside all allowed skill "
             "directories. If this is a symlink, add the target directory to "
             f"{EXTRA_SKILLS_DIRS} or [skills].extra_allowed_dirs "
-            "in ~/.deepagents/config.toml."
+            f"in {PATHS.display(PATHS.profile.config_file)}."
         )
         raise PermissionError(msg)
 

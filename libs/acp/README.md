@@ -23,7 +23,7 @@ Then, navigate into the newly created folder and run `uv sync`:
 
 ```sh
 cd deepagents/libs/acp
-uv sync
+uv sync --group examples
 ```
 
 Rename the `.env.example` file to `.env` and add your [Anthropic](https://claude.com/platform/api) API key. You may also optionally set up tracing for your Deep Agent using [LangSmith](https://smith.langchain.com/) by populating the other env vars in the example file:
@@ -63,10 +63,16 @@ Now, open Zed's Agents Panel (e.g. with `CMD + Shift + ?`). You should see an op
 
 And that's it! You can now use the Deep Agent in Zed to interact with your project.
 
-If you need to upgrade your version of Deep Agents, run:
+If you need to upgrade your version of Deep Agents, pull the latest changes and re-sync:
 
 ```sh
-uv upgrade deepagents-acp
+git pull && uv sync --group examples
+```
+
+Or for specific packages:
+
+```sh
+uv lock --upgrade-package langchain_anthropic # for example
 ```
 
 ## Launch a custom Deep Agent with ACP
@@ -103,6 +109,20 @@ async def main() -> None:
 if __name__ == "__main__":
     asyncio.run(main())
 ```
+
+### Persist and load sessions
+
+`AgentServerACP` can advertise and implement ACP's `session/load` capability when the
+agent uses a durable LangGraph checkpointer:
+
+```python
+server = AgentServerACP(agent, load_sessions=True)
+```
+
+The checkpointer must remain available across agent-process restarts. An in-memory
+checkpointer is suitable for tests but does not provide restart persistence. On load, the
+adapter restores the LangGraph thread, verifies the original working directory, and replays
+the conversation to the client through `session/update` before returning.
 
 ### Launch with Toad
 
@@ -146,7 +166,7 @@ Select a model by passing `--model` (in `provider:model-name` form) to the comma
     "Deep Agents Code": {
       "type": "custom",
       "command": "dcode",
-      "args": ["--acp", "--model", "anthropic:claude-sonnet-4-5"]
+      "args": ["--acp", "--model", "anthropic:claude-sonnet-5"]
     }
   }
 }
@@ -165,9 +185,9 @@ from deepagents_acp.server import AgentServerACP, AgentSessionContext
 
 # Define available models
 models = [
-    {"value": "anthropic:claude-opus-4-6", "name": "Claude Opus 4"},
-    {"value": "anthropic:claude-sonnet-4", "name": "Claude Sonnet 4"},
-    {"value": "openai:gpt-4-turbo", "name": "GPT-4 Turbo"},
+    {"value": "anthropic:claude-opus-5", "name": "Claude Opus 5"},
+    {"value": "anthropic:claude-sonnet-5", "name": "Claude Sonnet 5"},
+    {"value": "openai:gpt-6-astra", "name": "GPT-6 Astra"},
 ]
 
 # Create an agent factory that uses the model from context
