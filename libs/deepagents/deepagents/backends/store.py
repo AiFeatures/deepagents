@@ -1,5 +1,6 @@
 """`StoreBackend`: Adapter for LangGraph's BaseStore (persistent, cross-thread)."""
 
+import base64
 import re
 from collections.abc import Callable
 from typing import TYPE_CHECKING, Any, cast
@@ -12,10 +13,14 @@ from deepagents.backends.protocol import (
     BackendProtocol,
     DeleteResult,
     EditResult,
+    FileData,
     FileDownloadResponse,
     FileInfo,
     FileUploadResponse,
-    GrepMatch,
+    GlobResult,
+    GrepResult,
+    LsResult,
+    ReadResult,
     WriteResult,
 )
 from deepagents.backends.utils import (
@@ -24,9 +29,9 @@ from deepagents.backends.utils import (
     _glob_search_files,
     create_file_data,
     file_data_to_string,
-    format_read_response,
     grep_matches_from_files,
     perform_string_replacement,
+    slice_read_response,
     update_file_data,
 )
 
@@ -177,7 +182,8 @@ class StoreBackend(BackendProtocol):
             ValueError: If the store item has no content.
             TypeError: If content is neither a string nor a legacy list of strings.
         """
-        if "content" not in store_item.value or not isinstance(store_item.value["content"], list):
+        raw_content = store_item.value.get("content")
+        if raw_content is None:
             msg = f"Store item does not contain valid content field. Got: {store_item.value.keys()}"
             raise ValueError(msg)
 
@@ -355,15 +361,15 @@ class StoreBackend(BackendProtocol):
         infos.extend(FileInfo(path=subdir, is_dir=True, size=0, modified_at="") for subdir in sorted(subdirs))
 
         infos.sort(key=lambda x: x.get("path", ""))
-        return infos
+        return LsResult(entries=infos)
 
     def read(
         self,
         file_path: str,
         offset: int = 0,
         limit: int = 2000,
-    ) -> str:
-        """Read file content with line numbers.
+    ) -> ReadResult:
+        """Read file content for the requested line range.
 
         Args:
             file_path: Absolute file path.
@@ -380,12 +386,12 @@ class StoreBackend(BackendProtocol):
         item: Item | None = store.get(namespace, file_path)
 
         if item is None:
-            return f"Error: File '{file_path}' not found"
+            return ReadResult(error=f"File '{file_path}' not found")
 
         try:
             file_data = self._convert_store_item_to_file_data(item)
         except ValueError as e:
-            return f"Error: {e}"
+            return ReadResult(error=str(e))
 
         if _get_backend_read_file_type(file_path) != "text":
             return ReadResult(file_data=file_data)
@@ -397,7 +403,7 @@ class StoreBackend(BackendProtocol):
         file_path: str,
         offset: int = 0,
         limit: int = 2000,
-    ) -> str:
+    ) -> ReadResult:
         """Async version of read using native store async methods.
 
         This avoids sync calls in async context by using `store.aget` directly.
@@ -407,12 +413,12 @@ class StoreBackend(BackendProtocol):
         item: Item | None = await store.aget(namespace, file_path)
 
         if item is None:
-            return f"Error: File '{file_path}' not found"
+            return ReadResult(error=f"File '{file_path}' not found")
 
         try:
             file_data = self._convert_store_item_to_file_data(item)
         except ValueError as e:
-            return f"Error: {e}"
+            return ReadResult(error=str(e))
 
         if _get_backend_read_file_type(file_path) != "text":
             return ReadResult(file_data=file_data)
@@ -586,7 +592,7 @@ class StoreBackend(BackendProtocol):
 
     # Removed legacy grep() convenience to keep lean surface
 
-    def grep_raw(
+    def grep(
         self,
         pattern: str,
         path: str | None = None,
@@ -632,7 +638,7 @@ class StoreBackend(BackendProtocol):
             # errors, sending the model off rewriting a glob that was fine.
             return GlobResult(error=str(exc))
         if result == "No files found":
-            return []
+            return GlobResult(matches=[])
         paths = result.split("\n")
         infos: list[FileInfo] = []
         for p in paths:
@@ -646,10 +652,13 @@ class StoreBackend(BackendProtocol):
                     "modified_at": fd.get("modified_at", "") if fd else "",
                 }
             )
-        return infos
+        return GlobResult(matches=infos)
 
     def upload_files(self, files: list[tuple[str, bytes]]) -> list[FileUploadResponse]:
         """Upload multiple files to the store.
+
+        Binary files (images, PDFs, etc.) are stored as base64-encoded strings.
+        Text files are stored as utf-8 strings.
 
         Args:
             files: List of `(path, content)` tuples where content is bytes.
@@ -664,12 +673,16 @@ class StoreBackend(BackendProtocol):
         responses: list[FileUploadResponse] = []
 
         for path, content in files:
-            content_str = content.decode("utf-8")
-            # Create file data
-            file_data = create_file_data(content_str)
+            try:
+                content_str = content.decode("utf-8")
+                encoding = "utf-8"
+            except UnicodeDecodeError:
+                content_str = base64.standard_b64encode(content).decode("ascii")
+                encoding = "base64"
+
+            file_data = create_file_data(content_str, encoding=encoding)
             store_value = self._convert_file_data_to_store_value(file_data)
 
-            # Store the file
             store.put(namespace, path, store_value)
             responses.append(FileUploadResponse(path=path, error=None))
 
@@ -698,9 +711,10 @@ class StoreBackend(BackendProtocol):
                 continue
 
             file_data = self._convert_store_item_to_file_data(item)
-            # Convert file data to bytes
             content_str = file_data_to_string(file_data)
-            content_bytes = content_str.encode("utf-8")
+
+            encoding = file_data["encoding"]
+            content_bytes = base64.standard_b64decode(content_str) if encoding == "base64" else content_str.encode("utf-8")
 
             responses.append(FileDownloadResponse(path=path, content=content_bytes, error=None))
 

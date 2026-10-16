@@ -718,7 +718,7 @@ def _list_skills_with_errors(backend: BackendProtocol, source_path: str) -> tupl
 
     # Find all skill directories (directories containing SKILL.md)
     skill_dirs = []
-    for item in items:
+    for item in items or []:
         if not item.get("is_dir"):
             continue
         skill_dirs.append(item["path"])
@@ -784,7 +784,7 @@ async def _alist_skills_with_errors(backend: BackendProtocol, source_path: str) 
 
     # Find all skill directories (directories containing SKILL.md)
     skill_dirs = []
-    for item in items:
+    for item in items or []:
         if not item.get("is_dir"):
             continue
         skill_dirs.append(item["path"])

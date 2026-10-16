@@ -128,28 +128,6 @@ class CompletionController(Protocol):
 # Slash Command Completion
 # ============================================================================
 
-SLASH_COMMANDS: list[tuple[str, str, str]] = [
-    ("/help", "Show help", ""),
-    ("/changelog", "Open changelog in browser", ""),
-    ("/clear", "Clear chat and start new thread", "reset"),
-    ("/compact", "Summarize conversation to reduce context usage", ""),
-    ("/docs", "Open documentation in browser", ""),
-    ("/feedback", "Submit a bug report or feature request", ""),
-    ("/mcp", "Show active MCP servers and tools", "servers"),
-    ("/model", "Switch or configure model (--model-params, --default)", ""),
-    ("/quit", "Exit app", "close leave"),
-    ("/reload", "Reload config from environment variables and .env", "refresh"),
-    ("/remember", "Update memory and skills from conversation", ""),
-    ("/tokens", "Token usage", "cost"),
-    ("/threads", "Browse and resume previous threads", "continue history sessions"),
-    ("/trace", "Open current thread in LangSmith", ""),
-    ("/version", "Show version", ""),
-]
-"""Built-in slash commands: (name, description, hidden_keywords).
-
-Hidden keywords are space-separated terms that participate in fuzzy matching
-but are never displayed to the user.
-"""
 
 MAX_SUGGESTIONS = 10
 """UI cap so the completion popup doesn't get unwieldy."""

@@ -453,7 +453,7 @@ class TestFilesystemMiddleware:
         middleware = FilesystemMiddleware(backend=backend)
         glob_search_tool = next(tool for tool in middleware.tools if tool.name == "glob")
 
-        def slow_glob_info(*_args: object, **_kwargs: object) -> list[dict[str, str]]:
+        def slow_glob(*_args: object, **_kwargs: object) -> list[dict[str, str]]:
             time.sleep(2)
             return []
 
@@ -1250,6 +1250,7 @@ class TestFilesystemMiddleware:
                 f"/file{i}.txt",
                 {
                     "content": [f"content {i}"],
+                    "encoding": "utf-8",
                     "created_at": "2021-01-01",
                     "modified_at": "2021-01-01",
                 },
@@ -1270,6 +1271,7 @@ class TestFilesystemMiddleware:
                 f"/file{i}.txt",
                 {
                     "content": [f"content {i}"],
+                    "encoding": "utf-8",
                     "created_at": "2021-01-01",
                     "modified_at": "2021-01-01",
                 },
@@ -1289,6 +1291,7 @@ class TestFilesystemMiddleware:
                 f"/file{i}.txt",
                 {
                     "content": [f"content {i}"],
+                    "encoding": "utf-8",
                     "created_at": "2021-01-01",
                     "modified_at": "2021-01-01",
                 },
@@ -1308,6 +1311,7 @@ class TestFilesystemMiddleware:
                 f"/file{i}.txt",
                 {
                     "content": [f"content {i}"],
+                    "encoding": "utf-8",
                     "created_at": "2021-01-01",
                     "modified_at": "2021-01-01",
                     "type": "test" if i % 2 == 0 else "other",
@@ -1331,6 +1335,7 @@ class TestFilesystemMiddleware:
                 f"/file{i}.txt",
                 {
                     "content": [f"content {i}"],
+                    "encoding": "utf-8",
                     "created_at": "2021-01-01",
                     "modified_at": "2021-01-01",
                 },
@@ -1343,20 +1348,19 @@ class TestFilesystemMiddleware:
         assert keys == {f"/file{i}.txt" for i in range(55)}
 
     def test_create_file_data_preserves_long_lines(self):
-        """Test that create_file_data stores long lines as-is without splitting."""
+        """Test that create_file_data stores content as a single string."""
         long_line = "a" * 3500
         short_line = "short line"
         content = f"{short_line}\n{long_line}"
 
         file_data = create_file_data(content)
 
-        assert len(file_data["content"]) == 2
-        assert file_data["content"][0] == short_line
-        assert file_data["content"][1] == long_line
-        assert len(file_data["content"][1]) == 3500
+        assert isinstance(file_data["content"], str)
+        assert file_data["content"] == content
+        assert file_data["encoding"] == "utf-8"
 
     def test_update_file_data_preserves_long_lines(self):
-        """Test that update_file_data stores long lines as-is without splitting."""
+        """Test that update_file_data stores content as a single string."""
         initial_file_data = create_file_data("initial content")
 
         long_line = "b" * 5000
@@ -1365,10 +1369,9 @@ class TestFilesystemMiddleware:
 
         updated_file_data = update_file_data(initial_file_data, new_content)
 
-        assert len(updated_file_data["content"]) == 2
-        assert updated_file_data["content"][0] == short_line
-        assert updated_file_data["content"][1] == long_line
-        assert len(updated_file_data["content"][1]) == 5000
+        assert isinstance(updated_file_data["content"], str)
+        assert updated_file_data["content"] == new_content
+        assert updated_file_data["encoding"] == "utf-8"
 
         assert updated_file_data["created_at"] == initial_file_data["created_at"]
 
@@ -2251,8 +2254,8 @@ class TestFilesystemMiddleware:
         assert isinstance(file_content, str)
         text = file_content
         # Should start with the actual text, not with "[{" which would indicate stringified dict
-        assert file_text.startswith("Hello world!")
-        assert not file_text.startswith("[{")
+        assert text.startswith("Hello world!")
+        assert not text.startswith("[{")
 
     def test_multiple_text_blocks_joins_text(self):
         """Test that multiple text blocks are joined, not stringified."""
@@ -2371,17 +2374,17 @@ class TestFilesystemMiddleware:
         )
 
         read_file_tool = next(tool for tool in middleware.tools if tool.name == "read_file")
-        result = read_file_tool.invoke({"file_path": "/app/frame_001.jpg", "runtime": runtime})
+        result = read_file_tool.invoke({"file_path": "/app/screenshot.png", "runtime": runtime})
 
         assert isinstance(result, ToolMessage)
         assert result.name == "read_file"
         assert result.tool_call_id == "img-read-1"
-        assert result.additional_kwargs["read_file_path"] == "/app/frame_001.jpg"
-        assert result.additional_kwargs["read_file_media_type"] == "image/jpeg"
+        assert result.additional_kwargs["read_file_path"] == "/app/screenshot.png"
+        assert result.additional_kwargs["read_file_media_type"] == "image/png"
         assert isinstance(result.content, list)
         assert result.content[0]["type"] == "image"
-        assert result.content[0]["mime_type"] == "image/jpeg"
-        assert result.content[0]["base64"] == "ZmFrZS1pbWFnZS1ieXRlcw=="
+        assert result.content[0]["mime_type"] == "image/png"
+        assert result.content[0]["base64"] == "<base64_data>"
 
     def test_read_file_base64_unknown_extension_returns_file_block(self):
         """Binary reads route on `encoding`, not the extension map (#3657).
@@ -2494,8 +2497,8 @@ class TestFilesystemMiddleware:
         """Image reads should return a clear backend error string."""
 
         class ImageBackend(StateBackend):
-            def download_files(self, paths: list[str]) -> list[FileDownloadResponse]:
-                return [FileDownloadResponse(path=paths[0], content=None, error="file_not_found")]
+            def read(self, path, *, offset=0, limit=100):
+                return ReadResult(error="file_not_found")
 
         middleware = FilesystemMiddleware(backend=ImageBackend())
         state = FilesystemState(messages=[], files={})

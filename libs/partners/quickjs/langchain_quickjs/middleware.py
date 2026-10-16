@@ -75,8 +75,6 @@ class REPLState(AgentState):
     ]
     _quickjs_snapshot_hmac: NotRequired[Annotated[bytes, PrivateStateAttr]]
 
-CRITICAL: The REPL does NOT retain state between calls. Each `repl` invocation is evaluated from scratch.
-Do NOT assume variables, functions, imports, or helper objects from prior `repl` calls are available.
 
 class EvalSchema(BaseModel):
     """Input schema for the `eval` tool."""

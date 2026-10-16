@@ -1076,16 +1076,6 @@ def _discard_task_result(task: asyncio.Future[Any]) -> None:
 
 DEFAULT_READ_OFFSET = 0
 DEFAULT_READ_LIMIT = 100
-IMAGE_EXTENSIONS = frozenset({".png", ".jpg", ".jpeg", ".gif", ".webp"})
-IMAGE_MEDIA_TYPES = {
-    ".png": "image/png",
-    ".jpg": "image/jpeg",
-    ".jpeg": "image/jpeg",
-    ".gif": "image/gif",
-    ".webp": "image/webp",
-}
-
-
 # Template for truncation message in read_file
 # {file_path} will be filled in at runtime
 READ_FILE_TRUNCATION_MSG = (

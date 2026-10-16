@@ -86,6 +86,7 @@ ignore = [
     "PLR0911",  # Too many return statements — branchy marshalers (JSON→TS, value formatting) are intentionally flat
     "PLR0913",  # Too many arguments — middleware constructors legitimately expose many knobs
 ]
+extend-safe-fixes = ["PLR6201"]
 
 [tool.ruff.lint.pydocstyle]
 convention = "google"

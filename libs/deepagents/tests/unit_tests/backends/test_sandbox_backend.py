@@ -225,6 +225,7 @@ def test_glob_command_template_format() -> None:
 def test_read_uses_execute() -> None:
     """Test that read() delegates to execute() for server-side pagination."""
     sandbox = MockSandbox()
+    sandbox._next_output = json.dumps({"encoding": "utf-8", "content": "line one\nline two\nline three"})
 
     result = sandbox.read("/test/file.txt")
 
@@ -1255,13 +1256,13 @@ def test_sandbox_grep_literal_search() -> None:
     sandbox.execute = mock_execute
 
     # Test with parentheses (should be literal, not regex grouping)
-    matches = sandbox.grep_raw("def __init__(", path="/test")
-    assert isinstance(matches, list)
+    matches = sandbox.grep("def __init__(", path="/test").matches
+    assert matches is not None
     assert len(matches) == 2
 
     # Test with pipe character (should be literal, not regex OR)
-    matches = sandbox.grep_raw("str | int", path="/test")
-    assert isinstance(matches, list)
+    matches = sandbox.grep("str | int", path="/test").matches
+    assert matches is not None
 
     # Verify the command uses grep -rHnFZ for literal search and NUL-delimited paths.
     assert sandbox.last_command is not None

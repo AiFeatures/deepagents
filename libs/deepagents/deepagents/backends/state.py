@@ -11,10 +11,14 @@ from deepagents.backends.protocol import (
     BackendProtocol,
     DeleteResult,
     EditResult,
+    FileData,
     FileDownloadResponse,
     FileInfo,
     FileUploadResponse,
-    GrepMatch,
+    GlobResult,
+    GrepResult,
+    LsResult,
+    ReadResult,
     WriteResult,
 )
 from deepagents.backends.utils import (
@@ -24,9 +28,9 @@ from deepagents.backends.utils import (
     _glob_search_files,
     create_file_data,
     file_data_to_string,
-    format_read_response,
     grep_matches_from_files,
     perform_string_replacement,
+    slice_read_response,
     update_file_data,
 )
 
@@ -166,15 +170,15 @@ class StateBackend(BackendProtocol):
         infos.extend(FileInfo(path=subdir, is_dir=True, size=0, modified_at="") for subdir in sorted(subdirs))
 
         infos.sort(key=lambda x: x.get("path", ""))
-        return infos
+        return LsResult(entries=infos)
 
     def read(
         self,
         file_path: str,
         offset: int = 0,
         limit: int = 2000,
-    ) -> str:
-        """Read file content with line numbers.
+    ) -> ReadResult:
+        """Read file content for the requested line range.
 
         Args:
             file_path: Absolute file path.
@@ -190,7 +194,7 @@ class StateBackend(BackendProtocol):
         file_data = files.get(file_path)
 
         if file_data is None:
-            return f"Error: File '{file_path}' not found"
+            return ReadResult(error=f"File '{file_path}' not found")
 
         if _get_backend_read_file_type(file_path) != "text":
             # Normalize legacy `list[str]` content to a string without mutating
@@ -300,7 +304,7 @@ class StateBackend(BackendProtocol):
             # errors, sending the model off rewriting a glob that was fine.
             return GlobResult(error=str(exc))
         if result == "No files found":
-            return []
+            return GlobResult(matches=[])
         paths = result.split("\n")
         infos: list[FileInfo] = []
         for p in paths:
@@ -314,7 +318,7 @@ class StateBackend(BackendProtocol):
                     "modified_at": fd.get("modified_at", "") if fd else "",
                 }
             )
-        return infos
+        return GlobResult(matches=infos)
 
     def upload_files(self, files: list[tuple[str, bytes]]) -> list[FileUploadResponse]:
         """Upload multiple files to state.
@@ -363,10 +367,10 @@ class StateBackend(BackendProtocol):
                 responses.append(FileDownloadResponse(path=path, content=None, error="file_not_found"))
                 continue
 
-            # Convert file data to bytes
             content_str = file_data_to_string(file_data)
-            content_bytes = content_str.encode("utf-8")
 
+            encoding = file_data.get("encoding", "utf-8")
+            content_bytes = content_str.encode("utf-8") if encoding == "utf-8" else base64.standard_b64decode(content_str)
             responses.append(FileDownloadResponse(path=path, content=content_bytes, error=None))
 
         return responses

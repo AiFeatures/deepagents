@@ -10,8 +10,6 @@
 #   OPENAI_API_KEY     — needed for OpenAI models
 #   GOOGLE_API_KEY     — needed for Google models
 #   XAI_API_KEY        — needed for xAI/Grok models
-#   MISTRAL_API_KEY    — needed for Mistral models
-#   DEEPSEEK_API_KEY   — needed for DeepSeek models
 #   GROQ_API_KEY       — needed for Groq-hosted models
 #   OLLAMA_API_KEY     — needed for Ollama Cloud models
 #   OLLAMA_HOST        — set to https://ollama.com for cloud inference
@@ -858,7 +856,7 @@ jobs:
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
       - name: "📥 Download eval artifacts"
-        uses: actions/download-artifact@v8
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
         with:
           path: evals_artifacts
 

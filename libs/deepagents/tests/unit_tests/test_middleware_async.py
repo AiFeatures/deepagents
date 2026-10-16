@@ -309,7 +309,7 @@ class TestFilesystemMiddlewareAsync:
         middleware = FilesystemMiddleware(backend=backend)
         glob_search_tool = next(tool for tool in middleware.tools if tool.name == "glob")
 
-        async def slow_aglob_info(*_args: object, **_kwargs: object) -> list[dict[str, str]]:
+        async def slow_aglob(*_args: object, **_kwargs: object) -> list[dict[str, str]]:
             await asyncio.sleep(2)
             return []
 

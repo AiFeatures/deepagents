@@ -69,6 +69,8 @@ async def _serve_example_agent() -> None:
         )
 
         return create_deep_agent(
+            # Falls back to Deep Agent default model if not provided
+            model=context.model,
             checkpointer=checkpointer,
             backend=backend,
             interrupt_on=interrupt_config,

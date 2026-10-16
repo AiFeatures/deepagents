@@ -119,13 +119,13 @@ class MockBackend(BackendProtocol):
         self.download_raises = download_raises
         self.write_raises = write_raises
 
-    def read(self, path: str, offset: int = 0, limit: int = 2000) -> str:
+    def read(self, path: str, offset: int = 0, limit: int = 2000) -> ReadResult:
         self.read_calls.append(path)
         if self.existing_content is not None:
             return ReadResult(file_data={"content": self.existing_content, "encoding": "utf-8"})
         return ReadResult(file_data={"content": "", "encoding": "utf-8"})
 
-    async def aread(self, path: str, offset: int = 0, limit: int = 2000) -> str:
+    async def aread(self, path: str, offset: int = 0, limit: int = 2000) -> ReadResult:
         return self.read(path, offset, limit)
 
     def download_files(self, paths: list[str]) -> list[FileDownloadResponse]:

@@ -6,6 +6,7 @@ from time import time
 from typing import TYPE_CHECKING
 
 from textual.containers import Horizontal
+from textual.content import Content
 from textual.widgets import Static
 
 from deepagents_code.config import get_glyphs
@@ -69,12 +70,12 @@ class LoadingWidget(Static):
 
     LoadingWidget .loading-spinner {
         width: auto;
-        color: $warning;
+        color: $primary;
     }
 
     LoadingWidget .loading-status {
         width: auto;
-        color: $warning;
+        color: $primary;
     }
 
     LoadingWidget .loading-hint {
@@ -166,7 +167,7 @@ class LoadingWidget(Static):
 
         if self._spinner_widget:
             frame = self._spinner.next_frame()
-            self._spinner_widget.update(f"[#FFD800]{frame}[/]")
+            self._spinner_widget.update(frame)
 
         if self._hint_widget and self._start_time is not None:
             elapsed = int(time() - self._start_time)
@@ -202,7 +203,7 @@ class LoadingWidget(Static):
                 f"(paused at {format_duration(int(self._paused_elapsed))})"
             )
         if self._spinner_widget:
-            self._spinner_widget.update(f"[dim]{get_glyphs().pause}[/dim]")
+            self._spinner_widget.update(Content.styled(get_glyphs().pause, "dim"))
 
     def resume(self) -> None:
         """Resume the animation, excluding the paused interval from elapsed time.

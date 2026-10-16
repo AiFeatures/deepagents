@@ -510,9 +510,16 @@ def parse_file_mentions(text: str) -> tuple[str, list[Path]]:
             if resolved.exists() and resolved.is_file():
                 files.append(resolved)
             else:
-                console.print(f"[yellow]Warning: File not found: {raw_path}[/yellow]")
+                console.print(
+                    f"[yellow]Warning: File not found: "
+                    f"{escape_markup(raw_path)}[/yellow]"
+                )
         except (OSError, RuntimeError) as e:
-            console.print(f"[yellow]Warning: Invalid path {raw_path}: {e}[/yellow]")
+            console.print(
+                f"[yellow]Warning: Invalid path "
+                f"{escape_markup(raw_path)}: "
+                f"{escape_markup(str(e))}[/yellow]"
+            )
 
     return text, files
 

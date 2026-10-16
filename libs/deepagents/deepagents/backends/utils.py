@@ -507,7 +507,7 @@ def file_data_to_string(file_data: FileData) -> str:
     Raises:
         TypeError: If content is neither a string nor a legacy list of strings.
     """
-    return "\n".join(file_data["content"])
+    return _normalize_content(file_data)
 
 
 def create_file_data(
@@ -518,17 +518,18 @@ def create_file_data(
     """Create a `FileData` object with timestamps.
 
     Args:
-        content: File content as string
-        created_at: Optional creation timestamp (ISO format)
+        content: File content as string (plain text or base64-encoded binary).
+        created_at: Optional creation timestamp (ISO format).
+        encoding: Content encoding — `"utf-8"` for text, `"base64"` for binary.
 
     Returns:
         FileD`ata dict with content, encoding, and timestamps.
     """
-    lines = content.split("\n") if isinstance(content, str) else content
     now = datetime.now(UTC).isoformat()
 
     return {
-        "content": lines,
+        "content": content,
+        "encoding": encoding,
         "created_at": created_at or now,
         "modified_at": now,
     }
@@ -544,7 +545,6 @@ def update_file_data(file_data: FileData, content: str) -> FileData:
     Returns:
         Updated `FileData` dict
     """
-    lines = content.split("\n") if isinstance(content, str) else content
     now = datetime.now(UTC).isoformat()
 
     result = FileData(
@@ -1112,7 +1112,7 @@ def grep_matches_from_files(
     try:
         normalized_path = _normalize_path(path)
     except ValueError:
-        return []
+        return GrepResult(matches=[])
 
     filtered = _filter_files_by_path(files, normalized_path)
 
@@ -1125,7 +1125,8 @@ def grep_matches_from_files(
 
     matches: list[GrepMatch] = []
     for file_path, file_data in filtered.items():
-        for line_num, line in enumerate(file_data["content"], 1):
+        content_str = _normalize_content(file_data)
+        for line_num, line in enumerate(content_str.split("\n"), 1):
             if pattern in line:  # Simple substring search for literal matching
                 if max_count is not None and len(matches) >= max_count:
                     # A further match beyond `max_count` proves more exist; stop
@@ -1133,7 +1134,7 @@ def grep_matches_from_files(
                     # `max_count` matches is reported complete, not truncated.
                     return GrepResult(matches=matches, truncated=True)
                 matches.append({"path": file_path, "line": int(line_num), "text": line})
-    return matches
+    return GrepResult(matches=matches)
 
 
 def build_grep_results_dict(matches: list[GrepMatch]) -> dict[str, list[tuple[int, str]]]:

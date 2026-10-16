@@ -31,7 +31,11 @@ from deepagents.backends.protocol import (
     FileInfo,
     FileOperationError,
     FileUploadResponse,
+    GlobResult,
     GrepMatch,
+    GrepResult,
+    LsResult,
+    ReadResult,
     WriteResult,
 )
 from deepagents.backends.utils import (
@@ -431,8 +435,8 @@ class FilesystemBackend(BackendProtocol):
         file_path: str,
         offset: int = 0,
         limit: int = 2000,
-    ) -> str:
-        """Read file content with line numbers.
+    ) -> ReadResult:
+        """Read file content for the requested line range.
 
         Args:
             file_path: Absolute or relative file path.

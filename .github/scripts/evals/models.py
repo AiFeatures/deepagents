@@ -81,10 +81,6 @@ REGISTRY: tuple[Model, ...] = (
         "Anthropic",
     ),
     Model(
-        "anthropic:claude-sonnet-4-20250514",
-        frozenset({"eval:set0", "eval:anthropic", "harbor:set0", "harbor:anthropic"}),
-    ),
-    Model(
         "anthropic:claude-sonnet-4-5-20250929",
         frozenset({"eval:set0", "eval:anthropic", "harbor:set0", "harbor:anthropic"}),
         "Claude Sonnet 4.5",

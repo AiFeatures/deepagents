@@ -402,7 +402,7 @@ class GlobResult:
 
 # @abstractmethod to avoid breaking subclasses that only implement a subset
 class BackendProtocol(abc.ABC):  # noqa: B024
-    """Protocol for pluggable memory backends (single, unified).
+    r"""Protocol for pluggable memory backends (single, unified).
 
     Backends can store files in different locations (state, filesystem,
     database, etc.) and provide a uniform interface for file operations.
@@ -433,7 +433,7 @@ class BackendProtocol(abc.ABC):  # noqa: B024
     ```
     """
 
-    def ls_info(self, path: str) -> list["FileInfo"]:
+    def ls(self, path: str) -> "LsResult":
         """List all files in a directory with metadata.
 
         Args:
@@ -447,9 +447,9 @@ class BackendProtocol(abc.ABC):  # noqa: B024
         """
         raise NotImplementedError
 
-    async def als_info(self, path: str) -> list["FileInfo"]:
-        """Async version of ls_info."""
-        return await asyncio.to_thread(self.ls_info, path)
+    async def als(self, path: str) -> "LsResult":
+        """Async version of `ls`."""
+        return await asyncio.to_thread(self.ls, path)
 
     def read(
         self,
@@ -492,11 +492,11 @@ class BackendProtocol(abc.ABC):  # noqa: B024
         file_path: str,
         offset: int = 0,
         limit: int = 2000,
-    ) -> str:
+    ) -> ReadResult:
         """Async version of read."""
         return await asyncio.to_thread(self.read, file_path, offset, limit)
 
-    def grep_raw(
+    def grep(
         self,
         pattern: str,
         path: str | None = None,
@@ -555,7 +555,7 @@ class BackendProtocol(abc.ABC):  # noqa: B024
         """
         raise NotImplementedError
 
-    async def agrep_raw(
+    async def agrep(
         self,
         pattern: str,
         path: str | None = None,

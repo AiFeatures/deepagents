@@ -100,6 +100,8 @@ Each example has its own `README` with setup instructions.
 <details>
 <summary><h2>Contributing an example</h2></summary>
 
+See the [Contributing Guide](https://docs.langchain.com/oss/python/contributing/overview) for general contribution guidelines.
+
 When adding a new example:
 
 - **Use uv** for dependency management with a `pyproject.toml` and `uv.lock` (commit the lock file)

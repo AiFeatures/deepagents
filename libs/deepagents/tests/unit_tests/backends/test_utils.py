@@ -3,6 +3,8 @@
 from typing import Any
 
 import pytest
+from langchain_core.messages.content import ContentBlock
+from pydantic import TypeAdapter
 
 from deepagents.backends.protocol import FileData, ReadResult
 from deepagents.backends.utils import (

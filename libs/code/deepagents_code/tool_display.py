@@ -2,8 +2,8 @@
 
 This module handles rendering tool calls and tool messages for the TUI.
 
-Imported at runtime (not at CLI startup), so it can safely depend
-on heavier modules like `backends`.
+Imported at module level by `textual_adapter` (itself deferred from the startup
+path). Heavy SDK dependencies (e.g., `backends`) are deferred to function bodies.
 """
 
 import json
@@ -250,6 +250,8 @@ def format_tool_display(tool_name: str, tool_args: dict) -> str:
                 tool_args["command"], max_length=EXECUTE_HEADER_MAX_LENGTH
             )
             timeout = _coerce_timeout_seconds(tool_args.get("timeout"))
+            from deepagents.backends import DEFAULT_EXECUTE_TIMEOUT
+
             if timeout is not None and timeout != DEFAULT_EXECUTE_TIMEOUT:
                 timeout_str = _format_timeout(timeout)
                 return f'{prefix} {tool_name}("{command}", timeout={timeout_str})'
@@ -356,7 +358,8 @@ def _format_content_block(block: dict) -> str:
         mime = block.get("mime_type", "file")
         return f"[File: {mime}, ~{size_kb}KB]"
     try:
-        return json.dumps(block)
+        # Preserve non-ASCII characters (CJK, emoji, etc.) instead of \uXXXX escapes
+        return json.dumps(block, ensure_ascii=False)
     except (TypeError, ValueError):
         return str(block)
 
@@ -378,7 +381,8 @@ def format_tool_message_content(content: Any) -> str:  # noqa: ANN401  # Content
                 parts.append(_format_content_block(item))
             else:
                 try:
-                    parts.append(json.dumps(item))
+                    # Preserve non-ASCII characters (CJK, emoji, etc.)
+                    parts.append(json.dumps(item, ensure_ascii=False))
                 except (TypeError, ValueError):
                     parts.append(str(item))
         return "\n".join(parts)

@@ -440,6 +440,18 @@ class MessageData:
                 widget._deferred_expanded = self.tool_group_expanded
                 return widget
 
+            case MessageType.SKILL:
+                widget = SkillMessage(
+                    skill_name=self.skill_name or "unknown",
+                    description=self.skill_description or "",
+                    source=self.skill_source or "",
+                    body=self.skill_body or "",
+                    args=self.skill_args or "",
+                    id=self.id,
+                )
+                widget._deferred_expanded = self.skill_expanded
+                return widget
+
             case MessageType.ERROR:
                 return ErrorMessage(self.content, id=self.id)
 
@@ -506,6 +518,19 @@ class MessageData:
         )
 
         widget_id = widget.id or f"msg-{uuid.uuid4().hex}"
+
+        if isinstance(widget, SkillMessage):
+            return cls(
+                type=MessageType.SKILL,
+                content="",
+                id=widget_id,
+                skill_name=widget._skill_name,
+                skill_description=widget._description,
+                skill_source=widget._source,
+                skill_body=widget._body,
+                skill_args=widget._args,
+                skill_expanded=widget._expanded,
+            )
 
         if isinstance(widget, UserMessage):
             return cls(

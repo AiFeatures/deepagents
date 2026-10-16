@@ -70,16 +70,6 @@ def make_memory_content(title: str, content: str) -> str:
 """
 
 
-@contextmanager
-def _config_context(config: dict):
-    """Set a LangGraph config context so get_config() works in tests."""
-    token = var_child_runnable_config.set(config)
-    try:
-        yield
-    finally:
-        var_child_runnable_config.reset(token)
-
-
 def create_store_memory_item(content: str) -> dict:
     """Create a memory item in StoreBackend FileData format.
 
@@ -87,11 +77,12 @@ def create_store_memory_item(content: str) -> dict:
         content: Memory content string
 
     Returns:
-        Dict with content (as list of lines), created_at, and modified_at
+        Dict with content as str, encoding, created_at, and modified_at
     """
     timestamp = datetime.now(UTC).isoformat()
     return {
-        "content": content.split("\n"),
+        "content": content,
+        "encoding": "utf-8",
         "created_at": timestamp,
         "modified_at": timestamp,
     }

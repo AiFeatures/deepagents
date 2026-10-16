@@ -7,6 +7,7 @@ to extend them to other backends as well.
 from langchain_core.messages import AIMessage, HumanMessage, ToolMessage
 from langgraph.checkpoint.memory import InMemorySaver
 
+from deepagents.backends.state import StateBackend
 from deepagents.graph import create_deep_agent
 from tests.unit_tests.chat_model import GenericFakeChatModel
 
