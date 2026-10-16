@@ -19,6 +19,7 @@ from deepagents.backends.protocol import (
     WriteResult,
 )
 from deepagents.backends.utils import (
+    InvalidGlobPatternError,
     _get_backend_read_file_type,
     _glob_search_files,
     create_file_data,
@@ -340,7 +341,7 @@ class StoreBackend(BackendProtocol):
                 fd = self._convert_store_item_to_file_data(item)
             except ValueError:
                 continue
-            size = len(file_data_to_string(fd))
+            size = len(file_data_to_string(fd).encode("utf-8"))
             infos.append(
                 {
                     "path": item.key,
@@ -436,6 +437,7 @@ class StoreBackend(BackendProtocol):
             file_data = update_file_data(existing_file_data, content)
         else:
             file_data = create_file_data(content)
+        file_data["encoding"] = "utf-8"
         store_value = self._convert_file_data_to_store_value(file_data)
         store.put(namespace, file_path, store_value)
         return WriteResult(path=file_path)
@@ -458,6 +460,7 @@ class StoreBackend(BackendProtocol):
             file_data = update_file_data(existing_file_data, content)
         else:
             file_data = create_file_data(content)
+        file_data["encoding"] = "utf-8"
         store_value = self._convert_file_data_to_store_value(file_data)
         await store.aput(namespace, file_path, store_value)
         return WriteResult(path=file_path)
@@ -604,7 +607,12 @@ class StoreBackend(BackendProtocol):
         return grep_matches_from_files(files, pattern, path, glob, max_count=max_count)
 
     def glob(self, pattern: str, path: str | None = None) -> GlobResult:
-        """Find files matching a glob pattern in the store."""
+        """Find files matching a glob pattern in the store.
+
+        Matching follows the shared backend contract -- see `BackendProtocol.glob`.
+        A bare pattern is basename-at-any-depth, so `*.py` matches nested files.
+        A refused pattern is returned as `GlobResult(error=...)`, not raised.
+        """
         store = self._get_store()
         namespace = self._get_namespace()
         items = self._search_store_paginated(store, namespace)
@@ -614,14 +622,22 @@ class StoreBackend(BackendProtocol):
                 files[item.key] = self._convert_store_item_to_file_data(item)
             except ValueError:
                 continue
-        result = _glob_search_files(files, pattern, path)
+        try:
+            result = _glob_search_files(files, pattern, path)
+        except InvalidGlobPatternError as exc:
+            # `glob` is a tool boundary: report a refused pattern as a result
+            # rather than raising, matching FilesystemBackend and SandboxBackend.
+            # Catch the specific type -- a bare `ValueError` here would also
+            # capture path-normalization failures and mislabel them as pattern
+            # errors, sending the model off rewriting a glob that was fine.
+            return GlobResult(error=str(exc))
         if result == "No files found":
             return []
         paths = result.split("\n")
         infos: list[FileInfo] = []
         for p in paths:
             fd = files.get(p)
-            size = len(file_data_to_string(fd)) if fd else 0
+            size = len(file_data_to_string(fd).encode("utf-8")) if fd else 0
             infos.append(
                 {
                     "path": p,

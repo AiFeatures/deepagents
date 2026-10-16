@@ -41,6 +41,40 @@ class TestLargeToolResultGuidanceInToolDescriptions:
 class TestFilesystemMiddlewareInit:
     """Tests for FilesystemMiddleware initialization that don't require LLM invocation."""
 
+    def test_state_backend_adds_files_state(self) -> None:
+        middleware = FilesystemMiddleware(backend=StateBackend())
+        agent = create_agent(model=ChatAnthropic(model="claude-sonnet-4-6"), middleware=[middleware])
+
+        assert "files" in middleware.state_schema.__annotations__
+        assert "files" in agent.channels
+
+    def test_default_backend_adds_files_state(self) -> None:
+        middleware = FilesystemMiddleware()
+
+        assert "files" in middleware.state_schema.__annotations__
+
+    def test_non_state_backend_uses_base_state(self) -> None:
+        middleware = FilesystemMiddleware(backend=StoreBackend(namespace=lambda _rt: ("filesystem",)))
+        agent = create_agent(model=ChatAnthropic(model="claude-sonnet-4-6"), middleware=[middleware])
+
+        assert "files" not in middleware.state_schema.__annotations__
+        assert "files" not in agent.channels
+
+    def test_composite_state_backend_adds_files_state(self) -> None:
+        store_backend = StoreBackend(namespace=lambda _rt: ("filesystem",))
+        nested_backend = CompositeBackend(default=store_backend, routes={"/ephemeral/": StateBackend()})
+        backend = CompositeBackend(default=store_backend, routes={"/nested/": nested_backend})
+        middleware = FilesystemMiddleware(backend=backend)
+
+        assert "files" in middleware.state_schema.__annotations__
+
+    def test_composite_without_state_backend_uses_base_state(self) -> None:
+        store_backend = StoreBackend(namespace=lambda _rt: ("filesystem",))
+        backend = CompositeBackend(default=store_backend, routes={"/persistent/": store_backend})
+        middleware = FilesystemMiddleware(backend=backend)
+
+        assert "files" not in middleware.state_schema.__annotations__
+
     def test_backend_class_is_rejected(self) -> None:
         """Backend factories were removed in 0.7; callers must pass instances."""
         with pytest.raises(TypeError, match=r"Backend factories were removed in deepagents 0\.7"):

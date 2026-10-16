@@ -9,11 +9,14 @@ import argparse
 from rich.markup import escape
 
 from deepagents_code import theme
+from deepagents_code._constants import DEFAULT_AGENT_NAME, DEFAULT_THREAD_LIMIT
+from deepagents_code._paths import PATHS
 from deepagents_code._version import DOCS_URL, __version__
 from deepagents_code.config import (
     _get_editable_install_path,
     _is_editable_install,
     console,
+    parse_shell_allow_list,
 )
 
 _JSON_OPTION_LINE = "  --json                  Emit machine-readable JSON"
@@ -64,6 +67,28 @@ def non_negative_int(value: str) -> int:
         msg = f"must be a non-negative integer (>= 0), got {parsed}"
         raise argparse.ArgumentTypeError(msg)
     return parsed
+
+
+def shell_allow_list_arg(value: str) -> str:
+    """Argparse type that validates a shell allow-list without normalizing it.
+
+    Args:
+        value: Raw comma-separated CLI value.
+
+    Returns:
+        The original value for the CLI configuration provider.
+
+    Raises:
+        argparse.ArgumentTypeError: If the allow-list is malformed.
+    """
+    try:
+        parsed = parse_shell_allow_list(value)
+    except ValueError as exc:
+        raise argparse.ArgumentTypeError(str(exc)) from exc
+    if parsed is None:
+        msg = "must contain at least one non-empty command"
+        raise argparse.ArgumentTypeError(msg)
+    return value
 
 
 def _print_option_section(*lines: str, title: str = "Options") -> None:
@@ -120,7 +145,11 @@ def show_help() -> None:
         "  dcode doctor                              Print install diagnostics"
     )
     console.print(
-        "  dcode tools <install>                     Manage managed tools (ripgrep)"
+        "  dcode tools <install|list>                Manage managed tools (ripgrep)"
+    )
+    console.print("  dcode install NAME                        Install optional extras")
+    console.print(
+        "  dcode uninstall NAME                      Remove an optional extra"
     )
     console.print()
 
@@ -133,8 +162,10 @@ def show_help() -> None:
     console.print(
         "  --model-params JSON        Extra model kwargs (e.g., '{\"temperature\": 0.7}')"  # noqa: E501
     )
+    console.print("  --summarization-model MODEL")
+    console.print("                             Model for context-compaction summaries")
     console.print(
-        "  --max-retries N            Override max retries for transient model errors"
+        "  --max-retries N            Retries after a failed model request; 0 disables"
     )
     console.print("  --profile-override JSON    Override model profile fields as JSON")
     console.print("  -m, --message TEXT         Initial prompt to auto-submit on start")
@@ -142,10 +173,26 @@ def show_help() -> None:
     console.print(
         "  --startup-cmd CMD          Shell command to run at startup, before first prompt"  # noqa: E501
     )
-    console.print("  -y, --auto-approve         Enable classifier-backed Auto mode")
+    console.print(
+        "  -y, --auto-approve         Enable classifier-backed Auto mode (TUI or ACP);"
+    )
+    console.print(
+        "                             ignored with a warning in headless mode"
+    )
+    console.print("  --auto-classifier-model MODEL")
+    console.print(
+        "                             Model the Auto classifier reviews actions with"
+    )
+    console.print(
+        "                             Local TUI or ACP only; defaults to the "
+        "main agent model"
+    )
     console.print(
         "  --yolo                     Run gated actions without review after "
-        "acknowledgement"
+        "acknowledgement (TUI or ACP);"
+    )
+    console.print(
+        "                             ignored with a warning in headless mode"
     )
     console.print("  --sandbox TYPE             Remote sandbox for execution")
     console.print(
@@ -169,7 +216,24 @@ def show_help() -> None:
     )
     console.print("  --no-mcp                   Disable all MCP tool loading")
     console.print(
+        "  --no-tracing               Disable LangSmith agent tracing for this session"
+    )
+    console.print(
+        "                             Keeps local history and model-provider requests"
+    )
+    console.print(
         "  --trust-project-mcp        Trust project MCP configs (skip approval prompt)"
+    )
+    console.print(
+        "  --trust-project-hooks      Trust project hooks.json command handlers"
+    )
+    console.print(
+        "  --trust-project-extensions Trust project .deepagents/extensions Python "
+        "(experimental)"
+    )
+    console.print(
+        "  -e, --extension PATH       Load extension file or directory "
+        "(experimental, repeatable)"
     )
     console.print(
         "  --interpreter, --no-interpreter"
@@ -186,11 +250,21 @@ def show_help() -> None:
         "  --allow-fs-tools LIST      Filesystem tool allowlist: 'all' or "
         "comma-separated tool names (must include 'read_file')"
     )
-    console.print("  -n, --non-interactive MSG  Run a single task and exit")
+    console.print(
+        "  -n, --non-interactive MSG  Run one task and exit; no human approvals"
+    )
+    console.print(
+        "                             Can change files and access the network"
+    )
+    console.print(
+        "                             Shell off unless a shell allow-list is configured"
+    )
     console.print("  -q, --quiet                Clean output for piping (needs -n)")
     console.print(
         "  --no-stream                Buffer full response instead of streaming"
     )
+    console.print("  --show-reasoning           Show provider-visible reasoning")
+    console.print("                             On in the TUI, off by default with -n")
     console.print(
         "  --max-turns N              Max agentic turns before stopping (needs -n)"
     )
@@ -211,7 +285,6 @@ def show_help() -> None:
     )
     console.print(
         "  --recursion-limit N        Override the agent's graph recursion_limit"
-        " (default 2000)"
     )
     console.print(
         "  --timeout SECONDS          Hard wall-clock limit; exits 124 on expiry"
@@ -235,14 +308,13 @@ def show_help() -> None:
     console.print(
         "  --auto-update              Toggle automatic updates on or off, then exit"
     )
+    console.print("  --install NAME             Alias for `install NAME`")
+    console.print("  --uninstall NAME           Alias for `uninstall NAME`")
     console.print(
-        "  --install NAME             Install an optional extra (e.g. daytona)"
+        "  --package                  With install/--install, treat NAME as a "
+        "package (uv --with), not an extra"
     )
-    console.print(
-        "  --package                  With --install, treat NAME as a package "
-        "(uv --with), not an extra"
-    )
-    console.print("  --yes                      Skip --install confirmation prompts")
+    console.print("  --yes                      Skip install confirmation prompts")
     console.print("  --acp                      Run as an ACP server over stdio")
     console.print("  -v, --version              Show dcode and SDK versions")
     console.print("  -h, --help                 Show this help message and exit")
@@ -285,8 +357,9 @@ def show_list_help() -> None:
     console.print("[bold]Usage:[/bold]", style=theme.PRIMARY)
     console.print("  dcode list [options]")
     console.print()
+    agents_dir = escape(PATHS.display(PATHS.profile.root))
     console.print(
-        "List all agents found in ~/.deepagents/. Each agent has its own",
+        f"List all agents found in {agents_dir}. Each agent has its own",
     )
     console.print(
         "AGENTS.md system prompt and separate thread history.",
@@ -366,7 +439,7 @@ def show_skills_help() -> None:
     console.print("  trust             Manage trusted skill directories")
     console.print()
     _print_option_section(
-        "  --agent <name>    Specify agent identifier (default: agent)",
+        f"  --agent <name>    Specify agent identifier (default: {DEFAULT_AGENT_NAME})",
         "  --project         Use project-level skills instead of user-level",
         title="Common options",
     )
@@ -385,11 +458,12 @@ def show_skills_help() -> None:
         "[bold]Skill directories (highest precedence first):[/bold]",
         style=theme.PRIMARY,
     )
+    user_skills = escape(PATHS.display(PATHS.profile.agent_skills_dir("<agent>")))
     console.print(
         "  1. .agents/skills/                 project skills\n"
         "  2. .deepagents/skills/             project skills (alias)\n"
         "  3. ~/.agents/skills/               user skills\n"
-        "  4. ~/.deepagents/<agent>/skills/   user skills (alias)\n"
+        f"  4. {user_skills}   user skills (alias)\n"
         "  5. <package>/built_in_skills/      built-in skills",
     )
     console.print()
@@ -426,7 +500,7 @@ def show_skills_list_help() -> None:
     console.print("  dcode skills list [options]")
     console.print()
     _print_option_section(
-        "  --agent NAME            Agent identifier (default: agent)",
+        f"  --agent NAME            Agent identifier (default: {DEFAULT_AGENT_NAME})",
         "  --project               Show only project-level skills",
     )
     console.print()
@@ -444,7 +518,7 @@ def show_skills_create_help() -> None:
     console.print("  dcode skills create <name> [options]")
     console.print()
     _print_option_section(
-        "  --agent NAME            Agent identifier (default: agent)",
+        f"  --agent NAME            Agent identifier (default: {DEFAULT_AGENT_NAME})",
         "  --project               Create in project directory "
         "instead of user directory",
     )
@@ -462,7 +536,7 @@ def show_skills_info_help() -> None:
     console.print("  dcode skills info <name> [options]")
     console.print()
     _print_option_section(
-        "  --agent NAME            Agent identifier (default: agent)",
+        f"  --agent NAME            Agent identifier (default: {DEFAULT_AGENT_NAME})",
         "  --project               Search only in project skills",
     )
     console.print()
@@ -479,7 +553,7 @@ def show_skills_delete_help() -> None:
     console.print("  dcode skills delete <name> [options]")
     console.print()
     _print_option_section(
-        "  --agent NAME            Agent identifier (default: agent)",
+        f"  --agent NAME            Agent identifier (default: {DEFAULT_AGENT_NAME})",
         "  --project               Search only in project skills",
         "  -f, --force             Skip confirmation prompt",
         "  --dry-run               Show what would happen without making changes",
@@ -504,10 +578,11 @@ def show_skills_trust_help() -> None:
     console.print("  revoke <dir>      Revoke trust for a directory")
     console.print("  clear             Remove all trusted skill directories")
     console.print()
+    trust_store = escape(PATHS.display(PATHS.profile.state_dir / "skill_trust.json"))
     console.print(
         "Directories are trusted when you approve a skill that resolves "
         "outside the standard skill roots (for example, a symlink target). "
-        "Trust is stored in ~/.deepagents/.state/skill_trust.json."
+        f"Trust is stored in {trust_store}."
     )
     console.print()
     console.print("[bold]Examples:[/bold]", style=theme.PRIMARY)
@@ -625,10 +700,10 @@ def show_tools_install_help() -> None:
         "Download the pinned, SHA-256-verified ripgrep binary into",
     )
     console.print(
-        "~/.deepagents/bin (no sudo). Reuses a system `rg` already on PATH and",
+        "dcode's installation (no sudo). Reuses a system `rg` already on PATH",
     )
     console.print(
-        "is also handy for repairing a missing or stale managed binary.",
+        "and is also handy for repairing a missing or stale managed binary.",
     )
     console.print()
     _print_option_section()
@@ -650,6 +725,88 @@ def show_tools_install_help() -> None:
     console.print()
 
 
+def show_install_help() -> None:
+    """Show help information for the `install` subcommand."""
+    console.print()
+    console.print("[bold]Usage:[/bold]", style=theme.PRIMARY)
+    console.print("  dcode install NAME [options]")
+    console.print()
+    console.print(
+        "Install an optional deepagents-code extra into the current dcode",
+    )
+    console.print(
+        "environment (for example a sandbox provider or model provider).",
+    )
+    console.print(
+        "Distinct from `dcode tools install`, which provisions managed host",
+    )
+    console.print(
+        "binaries such as ripgrep.",
+    )
+    console.print()
+    # Do not use `_print_option_section` here: it appends the shared `--json`
+    # line, and `dcode install` does not accept that flag.
+    console.print("[bold]Options:[/bold]", style=theme.PRIMARY)
+    console.print(
+        "  --package               Treat NAME as a package added via `uv --with`"
+    )
+    console.print("  --yes                   Skip interactive confirmation prompts")
+    console.print(_HELP_OPTION_LINE)
+    console.print()
+    console.print("[bold]Examples:[/bold]", style=theme.PRIMARY)
+    console.print("  dcode install daytona")
+    console.print("  dcode install fireworks")
+    console.print("  dcode install not-listed-yet --yes")
+    console.print("  dcode install langchain-custom --package --yes")
+    console.print()
+    console.print(
+        "In-session equivalent: `/install NAME`. Legacy CLI alias:",
+        style=theme.MUTED,
+        highlight=False,
+    )
+    console.print(
+        "`dcode --install NAME`.",
+        style=theme.MUTED,
+        highlight=False,
+    )
+    console.print()
+
+
+def show_uninstall_help() -> None:
+    """Show help information for the `uninstall` subcommand."""
+    console.print()
+    console.print("[bold]Usage:[/bold]", style=theme.PRIMARY)
+    console.print("  dcode uninstall NAME")
+    console.print()
+    console.print("Remove an installed optional deepagents-code extra.")
+    console.print("dcode rebuilds the tool environment with the remaining extras.")
+    console.print()
+    console.print("[bold]Examples:[/bold]", style=theme.PRIMARY)
+    console.print("  dcode uninstall ollama")
+    console.print()
+    from deepagents_code.extras_info import (
+        BASE_DEPENDENCY_EXTRAS,
+        COMPOSITE_EXTRA_MEMBERS,
+    )
+
+    base = ", ".join(sorted(BASE_DEPENDENCY_EXTRAS))
+    composites = " or ".join(sorted(COMPOSITE_EXTRA_MEMBERS))
+    console.print("[bold]Restrictions:[/bold]", style=theme.PRIMARY)
+    console.print(f"  These extras are base dependencies: {base}.")
+    console.print("  They cannot be removed.")
+    console.print("  Editable and Homebrew installs cannot remove extras in place.")
+    console.print(f"  An extra installed through {composites} cannot be")
+    console.print("  removed on its own. Remove the composite extra instead.")
+    console.print()
+    console.print(
+        "In-session equivalent: `/uninstall NAME`. Legacy CLI alias:",
+        style=theme.MUTED,
+        highlight=False,
+    )
+    console.print("  dcode --uninstall ollama", style=theme.MUTED)
+    console.print()
+
+
 def _print_mcp_discovery_paths() -> None:
     """Print the auto-discovered MCP config paths in precedence order."""
     from deepagents_code.mcp_tools import MCP_CONFIG_DISCOVERY_PATHS
@@ -660,7 +817,7 @@ def _print_mcp_discovery_paths() -> None:
     )
     width = max(len(path) for path, _ in MCP_CONFIG_DISCOVERY_PATHS)
     for path, label in MCP_CONFIG_DISCOVERY_PATHS:
-        console.print(f"  {path:<{width}}  ({label})")
+        console.print(f"  {path:<{width}}  ({label})", markup=False, highlight=False)
     console.print(
         "  <project-root> = nearest ancestor with a `.git` entry, else CWD.",
         style=theme.MUTED,
@@ -686,7 +843,7 @@ def show_mcp_help() -> None:
     console.print("  dcode mcp <command> [options]")
     console.print()
     console.print("[bold]Commands:[/bold]", style=theme.PRIMARY)
-    console.print("  login <server>    Run the OAuth login flow for an MCP server")
+    console.print("  login [server]    List servers needing login or authenticate one")
     console.print("  config            Show MCP config discovery paths")
     console.print()
     _print_option_section()
@@ -709,7 +866,11 @@ def show_mcp_login_help() -> None:
     """Show help information for the `mcp login` subcommand."""
     console.print()
     console.print("[bold]Usage:[/bold]", style=theme.PRIMARY)
-    console.print("  dcode mcp login <server> [--mcp-config PATH]")
+    console.print("  dcode mcp login [server] [--mcp-config PATH]")
+    console.print()
+    console.print(
+        "With no server, lists configured OAuth servers that have no stored login."
+    )
     console.print()
     _print_option_section(
         "  --mcp-config PATH       Path to an MCP config JSON file "
@@ -722,6 +883,7 @@ def show_mcp_login_help() -> None:
     console.print(_MCP_CONFIG_FORMAT_EXAMPLE, style=theme.MUTED)
     console.print()
     console.print("[bold]Examples:[/bold]", style=theme.PRIMARY)
+    console.print("  dcode mcp login")
     console.print("  dcode mcp login notion")
     console.print("  dcode mcp login linear --mcp-config ./mcp-config.json")
     console.print()
@@ -751,17 +913,30 @@ def show_config_help() -> None:
     console.print()
     console.print("[bold]Usage:[/bold]", style=theme.PRIMARY)
     console.print("  dcode config [options]", markup=False)
-    console.print("  dcode config get <key> [--json]", markup=False)
+    console.print("  dcode config get <key|section> [--json] [--verbose]", markup=False)
     console.print("  dcode config path [--json]", markup=False)
     console.print()
     console.print("Show effective configuration values and their source.")
     console.print()
     console.print("[bold]Commands:[/bold]", style=theme.PRIMARY)
-    console.print("  get <key>         Show one option's value and source")
+    console.print("  get <key|section> Show one option, or a whole section")
     console.print("  path              Show config file locations")
     console.print()
     _print_option_section(
         "  -v, --verbose, --all  Also show each option's description and how to set it",
+    )
+    console.print()
+    console.print(
+        "  A section is a dotted key prefix (credentials, display), matched",
+        style=theme.MUTED,
+    )
+    console.print(
+        "  case-insensitively. Sections render the grouped view, and emit a",
+        style=theme.MUTED,
+    )
+    console.print(
+        "  JSON list instead of a single object.",
+        style=theme.MUTED,
     )
     console.print()
     console.print(
@@ -773,6 +948,8 @@ def show_config_help() -> None:
     console.print("  dcode config")
     console.print("  dcode config --verbose")
     console.print("  dcode config get interpreter.memory_limit_mb")
+    console.print("  dcode config get credentials")
+    console.print("  dcode config get display --json")
     console.print("  dcode config path")
     console.print()
 
@@ -876,7 +1053,8 @@ def show_threads_list_help() -> None:
         "  --branch TEXT             Filter by git branch name",
         "  --cwd [PATH]              Filter by working directory (no value = current)",
         "  --sort {created,updated}  Sort order (default: from config, or updated)",
-        "  -n, --limit N             Maximum threads to display (default: 20)",
+        "  -n, --limit N             Maximum threads to display "
+        f"(default: {DEFAULT_THREAD_LIMIT})",
         "  -v, --verbose             Show all columns (branch, created, prompt)",
         "  -r, --relative/--no-relative"
         "  Show relative timestamps (default: from config)",

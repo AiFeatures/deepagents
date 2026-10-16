@@ -1,5 +1,6 @@
 import mimetypes
 import time
+import warnings
 from unittest.mock import MagicMock, patch
 
 import pytest
@@ -20,6 +21,7 @@ from langgraph.types import Command
 from pydantic import ValidationError
 
 import deepagents.middleware.filesystem as filesystem_middleware
+from deepagents._api.deprecation import LangChainDeprecationWarning
 from deepagents.backends import CompositeBackend, StateBackend, StoreBackend
 from deepagents.backends.protocol import (
     BackendProtocol,
@@ -32,6 +34,8 @@ from deepagents.backends.protocol import (
 from deepagents.backends.utils import (
     TOOL_RESULT_TOKEN_LIMIT,
     TRUNCATION_GUIDANCE,
+    TRUNCATION_MARKER_TEMPLATE,
+    _format_source_block,
     create_file_data,
     format_content_with_line_numbers,
     sanitize_tool_call_id,
@@ -40,19 +44,25 @@ from deepagents.backends.utils import (
     update_file_data,
 )
 from deepagents.middleware._message_eviction import (
+    PREVIEW_LINE_CHAR_LIMIT,
     _build_evicted_content,
     _create_content_preview,
     _extract_text_from_message,
+    _preview_note,
+    _render_too_large_tool_msg,
 )
 from deepagents.middleware.filesystem import (
     EMPTY_CONTENT_WARNING,
     GLOB_TRUNCATION_NOTE,
     GREP_TRUNCATION_NOTE,
+    NO_LINES_REQUESTED_WARNING,
     FileData,
     FilesystemMiddleware,
     FilesystemPermission,
     FilesystemState,
     GrepSchema,
+    _build_truncated_human_message,
+    _format_glob_tool_result,
     supports_execution,
 )
 from deepagents.middleware.patch_tool_calls import PatchToolCallsMiddleware
@@ -315,8 +325,11 @@ class TestFilesystemMiddleware:
             }
         )
         result = result_raw.content
-        # Standard glob: *.py only matches files in root directory, not subdirectories
-        assert result == str(["/test.py"])
+        # Bare `*.py` matches the basename at any depth under the search root.
+        assert "/test.py" in result
+        assert "/pokemon/charmander.py" in result
+        assert "/test.txt" not in result
+        assert "/pokemon/squirtle.txt" not in result
 
     def test_glob_search_shortterm_wildcard_pattern(self):
         files = {
@@ -379,8 +392,9 @@ class TestFilesystemMiddleware:
             }
         )
         result = result_raw.content
+        # Path scopes the tree; bare patterns still match nested basenames under it.
         assert "/src/main.py" in result
-        assert "/src/utils/helper.py" not in result
+        assert "/src/utils/helper.py" in result
         assert "/tests/test_main.py" not in result
 
     def test_glob_search_shortterm_brace_expansion(self):
@@ -1358,6 +1372,12 @@ class TestFilesystemMiddleware:
 
         assert updated_file_data["created_at"] == initial_file_data["created_at"]
 
+    def test_format_source_block_returns_source_verbatim(self):
+        """The body carries no markers, so no source line needs escaping."""
+        content = ["    def foo():", "        return 1"]
+
+        assert _format_source_block(content) == "    def foo():\n        return 1"
+
     def test_format_content_with_line_numbers_short_lines(self):
         """Test that short lines (<=5000 chars) are displayed normally."""
         content = ["short line 1", "short line 2", "short line 3"]
@@ -1539,7 +1559,7 @@ class TestFilesystemMiddleware:
         result = read_file_tool.invoke({"runtime": _runtime(), "file_path": "/notes.txt", "offset": 0, "limit": 2})
 
         assert isinstance(result, ToolMessage)
-        assert result.content == ("1  one\n2  two\n\n[Read 2 lines (lines 1-2 of 5 total). 3 lines remaining from offset 2.]")
+        assert result.content == ("@@ lines 1-2 of 5 | next offset 2 @@\none\ntwo")
 
     def test_read_file_full_window_omits_remaining_lines_notice(self):
         files = {
@@ -1555,8 +1575,8 @@ class TestFilesystemMiddleware:
         result = read_file_tool.invoke({"runtime": _runtime(), "file_path": "/notes.txt", "offset": 0, "limit": 10})
 
         assert isinstance(result, ToolMessage)
-        assert result.content == "1  one\n2  two\n3  three"
-        assert "remaining from offset" not in result.content
+        assert result.content == "@@ lines 1-3 of 3 @@\none\ntwo\nthree"
+        assert "next offset" not in result.content
 
     def test_read_file_offset_window_reports_source_line_range(self):
         files = {
@@ -1572,7 +1592,7 @@ class TestFilesystemMiddleware:
         result = read_file_tool.invoke({"runtime": _runtime(), "file_path": "/notes.txt", "offset": 2, "limit": 2})
 
         assert isinstance(result, ToolMessage)
-        assert result.content == ("3  three\n4  four\n\n[Read 2 lines (lines 3-4 of 5 total). 1 line remaining from offset 4.]")
+        assert result.content == ("@@ lines 3-4 of 5 | next offset 4 @@\nthree\nfour")
 
     def test_read_file_single_line_window_uses_singular_read_unit(self):
         files = {
@@ -1588,7 +1608,128 @@ class TestFilesystemMiddleware:
         result = read_file_tool.invoke({"runtime": _runtime(), "file_path": "/notes.txt", "offset": 0, "limit": 1})
 
         assert isinstance(result, ToolMessage)
-        assert result.content == ("1  one\n\n[Read 1 line (lines 1-1 of 5 total). 4 lines remaining from offset 1.]")
+        assert result.content == ("@@ lines 1-1 of 5 | next offset 1 @@\none")
+
+    def _read_notes(self, *, offset: int, limit: int) -> ToolMessage:
+        """Invoke `read_file` against a fixed 3-line file with the given window."""
+        files = {
+            "/notes.txt": FileData(
+                content="one\ntwo\nthree",
+                encoding="utf-8",
+            )
+        }
+        backend, _ = _make_backend(files)
+        middleware = FilesystemMiddleware(backend=backend)
+        read_file_tool = next(tool for tool in middleware.tools if tool.name == "read_file")
+
+        result = read_file_tool.invoke({"runtime": _runtime(), "file_path": "/notes.txt", "offset": offset, "limit": limit})
+        assert isinstance(result, ToolMessage)
+        return result
+
+    @pytest.mark.parametrize("limit", [0, -3])
+    def test_read_file_non_positive_limit_does_not_claim_the_file_is_empty(self, limit):
+        """A zero-line window must not borrow the empty-file reminder.
+
+        The `read_file` description teaches the model that reminder means the
+        file itself is empty, so reusing it here would state something false
+        about a file that has contents.
+        """
+        result = self._read_notes(offset=0, limit=limit)
+
+        assert result.status == "success"
+        assert result.content == NO_LINES_REQUESTED_WARNING.format(limit=limit)
+        assert result.content != EMPTY_CONTENT_WARNING
+        assert "empty contents" not in result.content
+
+    @pytest.mark.parametrize("limit", [0, -3])
+    def test_read_file_non_positive_limit_empty_binary_keeps_empty_file_reminder(self, limit):
+        """An inspected-but-empty file must not borrow the zero-line-window warning.
+
+        Binary reads ignore `limit`, so a zero-byte binary is fully inspected
+        and comes back as empty base64; claiming it "was not inspected and may
+        have contents" would be false on both counts.
+        """
+        files = {
+            "/image.png": FileData(
+                content="",
+                encoding="base64",
+            )
+        }
+        backend, _ = _make_backend(files)
+        middleware = FilesystemMiddleware(backend=backend)
+        read_file_tool = next(tool for tool in middleware.tools if tool.name == "read_file")
+
+        result = read_file_tool.invoke({"runtime": _runtime(), "file_path": "/image.png", "offset": 0, "limit": limit})
+
+        assert isinstance(result, ToolMessage)
+        assert result.status == "success"
+        assert result.content == EMPTY_CONTENT_WARNING
+
+    @pytest.mark.parametrize("limit", [0, -3])
+    def test_read_file_non_positive_limit_empty_text_keeps_empty_file_reminder(self, limit):
+        """A genuinely empty text file reports emptiness regardless of `limit`.
+
+        The blank-content branch in `slice_read_response` runs before the
+        zero-`limit` check, so an empty file arrives as whitespace-only text,
+        not as a backend-declared zero-line window.
+        """
+        files = {
+            "/notes.txt": FileData(
+                content="",
+                encoding="utf-8",
+            )
+        }
+        backend, _ = _make_backend(files)
+        middleware = FilesystemMiddleware(backend=backend)
+        read_file_tool = next(tool for tool in middleware.tools if tool.name == "read_file")
+
+        result = read_file_tool.invoke({"runtime": _runtime(), "file_path": "/notes.txt", "offset": 0, "limit": limit})
+
+        assert isinstance(result, ToolMessage)
+        assert result.status == "success"
+        assert result.content == EMPTY_CONTENT_WARNING
+
+    def test_read_file_negative_offset_clamps_and_discloses(self):
+        """A clamped offset still reads, and says so.
+
+        The window reaches EOF here, which suppresses the pagination notice, so
+        the disclosure has to come from its own notice or the model gets a range
+        starting at line 1 with no sign its request was reinterpreted.
+        """
+        result = self._read_notes(offset=-1, limit=100)
+
+        assert result.status == "success"
+        assert result.content == (
+            "[Requested offset -1 is before the start of the file; read from line 1 instead.]\n@@ lines 1-3 of 3 @@\none\ntwo\nthree"
+        )
+
+    def test_read_file_non_negative_offset_has_no_clamp_notice(self):
+        """The clamp notice must not appear on ordinary reads."""
+        result = self._read_notes(offset=0, limit=100)
+
+        assert result.content == "@@ lines 1-3 of 3 @@\none\ntwo\nthree"
+
+    @pytest.mark.parametrize(("offset", "expected"), [(0, "1-3"), (5, "6-8"), (-1, "1-3")])
+    def test_read_file_without_window_metadata_still_states_a_range(self, offset: int, expected: str):
+        """A backend may return numberable text with no window metadata.
+
+        The header always states a range, so one is derived from the requested
+        offset. Emitting a fieldless `@@  @@` would match neither the TUI
+        parser nor the continuation middleware, leaving the model and the user
+        looking at bare protocol scaffolding.
+        """
+        backend, _ = _make_backend()
+        read_result = ReadResult(file_data=FileData(content="alpha\nbeta\ngamma", encoding="utf-8"))
+        middleware = FilesystemMiddleware(backend=backend)
+        read_file_tool = next(tool for tool in middleware.tools if tool.name == "read_file")
+
+        with patch.object(backend, "read", return_value=read_result):
+            result = read_file_tool.invoke({"runtime": _runtime(), "file_path": "/x.txt", "offset": offset, "limit": 100})
+
+        assert isinstance(result, ToolMessage)
+        header = next(line for line in result.content.splitlines() if line.startswith("@@ "))
+        assert header.startswith(f"@@ lines {expected}")
+        assert result.content.endswith("alpha\nbeta\ngamma")
 
     def test_read_file_unknown_total_reports_next_offset(self):
         backend, _ = _make_backend()
@@ -1605,7 +1746,7 @@ class TestFilesystemMiddleware:
             result = read_file_tool.invoke({"runtime": _runtime(), "file_path": "/notes.txt", "offset": 0, "limit": 1})
 
         assert isinstance(result, ToolMessage)
-        assert result.content == "1  one\n\n[Read 1 line (lines 1-1). More lines remain from offset 1.]"
+        assert result.content == "@@ lines 1-1 | next offset 1 @@\none"
 
     def test_read_file_truncation_omits_notice_when_no_complete_line_fits(self):
         backend, _ = _make_backend()
@@ -1623,8 +1764,8 @@ class TestFilesystemMiddleware:
             result = read_file_tool.invoke({"runtime": _runtime(), "file_path": "/notes.txt", "offset": 0, "limit": 1})
 
         assert isinstance(result, ToolMessage)
-        assert "Output was truncated due to size limits" in result.content
-        assert "remaining from offset" not in result.content
+        assert "truncated mid-line" in result.content
+        assert "next offset" not in result.content
 
     def test_read_file_truncation_recomputes_remaining_lines_notice(self):
         backend, _ = _make_backend()
@@ -1645,10 +1786,41 @@ class TestFilesystemMiddleware:
             result = read_file_tool.invoke({"runtime": _runtime(), "file_path": "/notes.txt", "offset": 0, "limit": 100})
 
         assert isinstance(result, ToolMessage)
-        numbered_lines = [line for line in result.content.splitlines() if line.lstrip().partition("  ")[0].isdigit()]
-        last_displayed_line = int(numbered_lines[-1].lstrip().partition("  ")[0])
+        header = next(line for line in result.content.splitlines() if line.startswith("@@ "))
+        last_displayed_line = int(header.split(" | ")[0].split("-")[1].split(" ")[0])
         assert last_displayed_line < 100
-        assert f"remaining from offset {last_displayed_line}.]" in result.content
+        assert f"next offset {last_displayed_line} " in header
+
+    def test_read_file_truncation_rebuilds_opening_marker_to_retained_range(self):
+        """Both envelope markers report the range actually retained.
+
+        A stale opening marker is not cosmetic: consumers take the source-line
+        count from it, so a marker still claiming the full requested window
+        advertises a resume offset past the rows truncation dropped.
+        """
+        backend, _ = _make_backend()
+        read_result = ReadResult(
+            file_data=FileData(
+                content="\n".join(f"line {line}: " + "x" * 80 for line in range(1, 101)),
+                encoding="utf-8",
+            ),
+            total_lines=120,
+            start_line=1,
+            end_line=100,
+            next_offset=100,
+        )
+        middleware = FilesystemMiddleware(backend=backend, tool_token_limit_before_evict=500)
+        read_file_tool = next(tool for tool in middleware.tools if tool.name == "read_file")
+
+        with patch.object(backend, "read", return_value=read_result):
+            result = read_file_tool.invoke({"runtime": _runtime(), "file_path": "/notes.txt", "offset": 0, "limit": 100})
+
+        assert isinstance(result, ToolMessage)
+        notice, header, *rows = result.content.split("\n")
+        retained = len(rows)
+        assert retained < 100
+        assert notice.startswith("[Output was truncated due to size limits.")
+        assert header == f"@@ lines 1-{retained} of 120 | next offset {retained} | truncated due to size @@"
 
     def test_read_file_truncation_adds_notice_when_backend_reached_eof(self):
         backend, _ = _make_backend()
@@ -1669,19 +1841,18 @@ class TestFilesystemMiddleware:
             result = read_file_tool.invoke({"runtime": _runtime(), "file_path": "/notes.txt", "offset": 0, "limit": 100})
 
         assert isinstance(result, ToolMessage)
-        numbered_lines = [line for line in result.content.splitlines() if line.lstrip().partition("  ")[0].isdigit()]
-        last_displayed_line = int(numbered_lines[-1].lstrip().partition("  ")[0])
+        header = next(line for line in result.content.splitlines() if line.startswith("@@ "))
+        last_displayed_line = int(header.split(" | ")[0].split("-")[1].split(" ")[0])
         assert last_displayed_line < 100
-        assert numbered_lines[-1].endswith("x" * 80)
-        assert f"remaining from offset {last_displayed_line}.]" in result.content
+        assert f"line {last_displayed_line}: " + "x" * 80 in result.content
+        assert f"next offset {last_displayed_line} " in header
 
     def test_read_file_truncation_never_splits_a_wrapped_source_line(self):
-        """When the budget cuts inside a wrapped line's rows, resume before that line.
+        """When the budget cannot fit an oversized line, resume before that line.
 
-        Source line 3 is 15000 chars, so it renders as rows `3`, `3.1`, `3.2`.
-        The char budget fits lines 1-2 but not the full wrapped line, so the
-        notice must report line 2 and resume from offset 2 — never advertise an
-        offset that lands inside the undisplayed tail of line 3.
+        Source line 3 is 15000 chars. The char budget fits lines 1-2 but not
+        that line, so the header must report line 2 and resume from offset 2 —
+        never an offset that lands inside the undisplayed tail of line 3.
         """
         backend, _ = _make_backend()
         read_result = ReadResult(
@@ -1701,10 +1872,13 @@ class TestFilesystemMiddleware:
             result = read_file_tool.invoke({"runtime": _runtime(), "file_path": "/notes.txt", "offset": 0, "limit": 100})
 
         assert isinstance(result, ToolMessage)
-        assert "Output was truncated due to size limits" in result.content
+        assert "truncated due to size" in result.content
         # Line 2 is the last complete source line that fits; the wrapped line 3
         # is dropped whole and the resume offset points at it, not inside it.
-        assert "[Read 2 lines (lines 1-2 of 10 total). 8 lines remaining from offset 2.]" in result.content
+        notice, header, *rows = result.content.split("\n")
+        assert notice.startswith("[Output was truncated due to size limits.")
+        assert header == "@@ lines 1-2 of 10 | next offset 2 | truncated due to size @@"
+        assert rows == ["aaa", "bbb"]
         # No partial rendering of the wrapped line leaked through.
         assert "c" * 5000 not in result.content
 
@@ -1983,6 +2157,40 @@ class TestFilesystemMiddleware:
         assert isinstance(result, ToolMessage)
         assert mem_store.get(("filesystem",), "/large_tool_results/test_call_id") is not None
 
+    def test_intercept_empty_tool_call_id_offloads_unique_files(self):
+        """Test that two large ToolMessages with empty tool_call_id don't collide on one offload path."""
+        backend, mem_store = _make_backend()
+        middleware = FilesystemMiddleware(backend=backend, tool_token_limit_before_evict=1000)
+
+        first = middleware._intercept_large_tool_result(ToolMessage(content="A" * 5000, tool_call_id=""))
+        second = middleware._intercept_large_tool_result(ToolMessage(content="B" * 5000, tool_call_id=""))
+
+        assert isinstance(first, ToolMessage)
+        assert isinstance(second, ToolMessage)
+        offloads = [i.key for i in mem_store.search(("filesystem",)) if i.key.startswith("/large_tool_results/unknown")]
+        assert len(offloads) == 2
+        assert first.content != second.content
+        assert "AAAA" not in second.content
+        assert "BBBB" not in first.content
+        first_file = mem_store.get(("filesystem",), offloads[0])
+        second_file = mem_store.get(("filesystem",), offloads[1])
+        assert first_file is not None and second_file is not None
+        assert {first_file.value["content"][:1], second_file.value["content"][:1]} == {"A", "B"}
+
+    async def test_aintercept_empty_tool_call_id_offloads_unique_files(self):
+        """Async empty-id offloads also get distinct paths."""
+        backend, mem_store = _make_backend()
+        middleware = FilesystemMiddleware(backend=backend, tool_token_limit_before_evict=1000)
+
+        first = await middleware._aintercept_large_tool_result(ToolMessage(content="A" * 5000, tool_call_id=""))
+        second = await middleware._aintercept_large_tool_result(ToolMessage(content="B" * 5000, tool_call_id=""))
+
+        assert isinstance(first, ToolMessage)
+        assert isinstance(second, ToolMessage)
+        offloads = [i.key for i in mem_store.search(("filesystem",)) if i.key.startswith("/large_tool_results/unknown")]
+        assert len(offloads) == 2
+        assert first.content != second.content
+
     def test_intercept_content_block_with_large_text(self):
         """Test that content blocks with large text get evicted and converted to string."""
         backend, mem_store = _make_backend()
@@ -2109,6 +2317,35 @@ class TestFilesystemMiddleware:
         result = middleware._intercept_large_tool_result(tool_message)
 
         assert result == tool_message
+
+    def test_read_file_zero_limit_on_image_still_returns_the_image(self):
+        """A zero limit must not turn a binary read into a no-lines reminder.
+
+        `limit` never applies to binary payloads, so the no-lines guard is
+        conditioned on empty content as well. Guarding on `limit` alone would
+        regress every image read that happens to carry a degenerate limit.
+        """
+
+        class ImageBackend(StateBackend):
+            def read(self, path, *, offset=0, limit=100):
+                return ReadResult(file_data={"content": "<base64_data>", "encoding": "base64"})
+
+        middleware = FilesystemMiddleware(backend=ImageBackend())
+        runtime = ToolRuntime(
+            state=FilesystemState(messages=[], files={}),
+            context=None,
+            tool_call_id="img-zero-limit",
+            store=None,
+            stream_writer=lambda _: None,
+            config={},
+        )
+
+        read_file_tool = next(tool for tool in middleware.tools if tool.name == "read_file")
+        result = read_file_tool.invoke({"file_path": "/app/screenshot.png", "runtime": runtime, "limit": 0})
+
+        assert isinstance(result, ToolMessage)
+        assert isinstance(result.content, list)
+        assert result.content[0]["type"] == "image"
 
     def test_read_file_image_returns_standard_image_content_block(self):
         """Test image reads return standard image blocks with base64 + mime_type."""
@@ -2290,6 +2527,122 @@ class TestFilesystemMiddleware:
 
         assert isinstance(result, ToolMessage)
         assert result.content == EMPTY_CONTENT_WARNING
+
+    @pytest.mark.parametrize(
+        ("body", "offset", "limit", "expected_rows"),
+        [
+            # Mid-file blank window.
+            ("line1\n\n\n\n\nline6\n", 1, 4, [2, 3, 4, 5]),
+            # Blank window starting at line 1 of a file that continues.
+            ("\n\n\nline4\nline5\n", 0, 3, [1, 2, 3]),
+            # Blank window ending at EOF but not starting at line 1.
+            ("line1\n\n\n", 1, 2, [2, 3]),
+        ],
+    )
+    def test_read_file_blank_window_of_non_empty_file_renders_lines(self, body: str, offset: int, limit: int, expected_rows: list[int]):
+        """A blank window of a file with content renders numbered blank lines."""
+        backend, _ = _make_backend()
+        middleware = FilesystemMiddleware(backend=backend)
+        runtime = _runtime("blank-window-read")
+
+        backend.write("/f.txt", body)
+
+        read_file_tool = next(tool for tool in middleware.tools if tool.name == "read_file")
+        result = read_file_tool.invoke({"file_path": "/f.txt", "offset": offset, "limit": limit, "runtime": runtime})
+
+        assert isinstance(result, ToolMessage)
+        assert result.content != EMPTY_CONTENT_WARNING
+        header, *rows = result.content.split("\n")
+        assert header.startswith(f"@@ lines {expected_rows[0]}-{expected_rows[-1]} ")
+        assert rows == ["" for _ in expected_rows]
+
+    @pytest.mark.parametrize(
+        ("content", "serialization"),
+        [
+            # Lines joined with "\n" as a separator: no trailing terminator.
+            ("a\nb\n\n", "separator-joined"),
+            # Terminators kept: the same window splits into a phantom "".
+            ("a\nb\n\n\n", "terminator-kept"),
+        ],
+    )
+    def test_read_file_window_ending_in_blank_row_keeps_that_row(self, content: str, serialization: str):
+        """A window whose last source row is blank renders every row it reports."""
+        backend, _ = _make_backend()
+        read_result = ReadResult(
+            file_data=FileData(content=content, encoding="utf-8"),
+            total_lines=5,
+            start_line=1,
+            end_line=4,
+            next_offset=4,
+        )
+        middleware = FilesystemMiddleware(backend=backend)
+        read_file_tool = next(tool for tool in middleware.tools if tool.name == "read_file")
+
+        with patch.object(backend, "read", return_value=read_result):
+            result = read_file_tool.invoke({"runtime": _runtime(), "file_path": "/f.txt"})
+
+        assert isinstance(result, ToolMessage)
+        assert result.content == "@@ lines 1-4 of 5 | next offset 4 @@\na\nb\n\n", serialization
+
+    def test_read_file_whitespace_only_file_with_pagination_returns_warning(self):
+        """A window spanning a whole whitespace-only file still describes an empty file."""
+        backend, _ = _make_backend()
+        read_result = ReadResult(
+            file_data=FileData(content=" \n\t", encoding="utf-8"),
+            total_lines=2,
+            start_line=1,
+            end_line=2,
+        )
+        middleware = FilesystemMiddleware(backend=backend)
+        read_file_tool = next(tool for tool in middleware.tools if tool.name == "read_file")
+
+        with patch.object(backend, "read", return_value=read_result):
+            result = read_file_tool.invoke({"runtime": _runtime(), "file_path": "/blank.txt"})
+
+        assert isinstance(result, ToolMessage)
+        assert result.content == EMPTY_CONTENT_WARNING
+
+    @pytest.mark.parametrize(("content", "end_line"), [("", 2), ("\n\n\n", 5)])
+    def test_read_file_blank_window_pads_to_reported_rows(self, content: str, end_line: int):
+        """A separator-joined blank window renders one row per line it reports."""
+        backend, _ = _make_backend()
+        read_result = ReadResult(
+            file_data=FileData(content=content, encoding="utf-8"),
+            total_lines=end_line + 1,
+            start_line=2,
+            end_line=end_line,
+            next_offset=end_line,
+        )
+        middleware = FilesystemMiddleware(backend=backend)
+        read_file_tool = next(tool for tool in middleware.tools if tool.name == "read_file")
+
+        with patch.object(backend, "read", return_value=read_result):
+            result = read_file_tool.invoke({"runtime": _runtime(), "file_path": "/notes.txt"})
+
+        assert isinstance(result, ToolMessage)
+        blank_rows = "\n".join("" for _ in range(2, end_line + 1))
+        expected_header = f"@@ lines 2-{end_line} of {end_line + 1} | next offset {end_line} @@"
+        assert result.content == f"{expected_header}\n{blank_rows}"
+
+    def test_read_file_keeps_backend_truncation_banner_past_window(self):
+        """Rows a backend appends beyond `end_line` survive padding."""
+        backend, _ = _make_backend()
+        banner = "\n\n[Output was truncated due to size limits.]"
+        read_result = ReadResult(
+            file_data=FileData(content="a\nb" + banner, encoding="utf-8"),
+            total_lines=9,
+            start_line=1,
+            end_line=2,
+            next_offset=2,
+        )
+        middleware = FilesystemMiddleware(backend=backend)
+        read_file_tool = next(tool for tool in middleware.tools if tool.name == "read_file")
+
+        with patch.object(backend, "read", return_value=read_result):
+            result = read_file_tool.invoke({"runtime": _runtime(), "file_path": "/big.txt"})
+
+        assert isinstance(result, ToolMessage)
+        assert "[Output was truncated due to size limits.]" in result.content
 
     def test_execute_tool_returns_error_when_backend_doesnt_support(self):
         """Test that execute tool returns friendly error instead of raising exception."""
@@ -2766,6 +3119,7 @@ class TestFilesystemMiddleware:
         assert "Hello world\nLine 2" in result.content
         assert "succeeded" in result.content
         assert "exit code 0" in result.content
+        assert result.artifact == {"exit_code": 0}
 
     def test_execute_tool_output_formatting_with_failure(self):
         """Test execute tool formats failure output correctly."""
@@ -2802,6 +3156,78 @@ class TestFilesystemMiddleware:
         assert "Error: command not found" in result.content
         assert "failed" in result.content
         assert "exit code 127" in result.content
+        assert result.artifact == {"exit_code": 127}
+
+    def test_execute_tool_omits_artifact_exit_code_when_unknown(self):
+        """Test execute tool omits `exit_code` when the backend reports none."""
+
+        # Backends may leave exit_code unset, and the capture-offload parse falls
+        # back to None when the wrapper's meta line is unreadable. None must not be
+        # published as a value: it is falsy like a successful 0 but unequal to it, so
+        # both `!= 0` and `if not exit_code` would misclassify it.
+        class UnknownExitCodeMockSandboxBackend(SandboxBackendProtocol, StateBackend):
+            def execute(self, command: str, *, timeout: int | None = None) -> ExecuteResponse:
+                return ExecuteResponse(output="some output")
+
+            @property
+            def id(self):
+                return "unknown-exit-code-mock-sandbox-backend"
+
+        rt = ToolRuntime(
+            state=FilesystemState(messages=[], files={}),
+            context=None,
+            tool_call_id="test_unknown_ec",
+            store=InMemoryStore(),
+            stream_writer=lambda _: None,
+            config={},
+        )
+
+        middleware = FilesystemMiddleware(backend=UnknownExitCodeMockSandboxBackend())
+        execute_tool = next(tool for tool in middleware.tools if tool.name == "execute")
+        result = execute_tool.invoke({"command": "echo test", "runtime": rt})
+
+        # The content omits the status line entirely for an unknown exit code, so the
+        # artifact must not imply one either.
+        assert "exit code" not in result.content
+        assert result.artifact == {}
+
+    def test_execute_tool_error_paths_carry_no_artifact(self):
+        """Test execute tool returns no artifact when no command ran."""
+
+        # Errors raised before the command runs have no exit code to report, so
+        # `artifact` stays None. Consumers must therefore guard rather than index --
+        # inventing a sentinel exit code here would be indistinguishable from a real
+        # command that exited with it.
+        class ErrorPathMockSandboxBackend(SandboxBackendProtocol, StateBackend):
+            def execute(self, command: str, *, timeout: int | None = None) -> ExecuteResponse:
+                msg = "bad parameter"
+                raise ValueError(msg)
+
+            @property
+            def id(self):
+                return "error-path-mock-sandbox-backend"
+
+        rt = ToolRuntime(
+            state=FilesystemState(messages=[], files={}),
+            context=None,
+            tool_call_id="test_err_artifact",
+            store=InMemoryStore(),
+            stream_writer=lambda _: None,
+            config={},
+        )
+
+        middleware = FilesystemMiddleware(backend=ErrorPathMockSandboxBackend())
+        execute_tool = next(tool for tool in middleware.tools if tool.name == "execute")
+
+        # Validation error: rejected before the backend is reached.
+        rejected = execute_tool.invoke({"command": "echo test", "timeout": -1, "runtime": rt})
+        assert rejected.status == "error"
+        assert rejected.artifact is None
+
+        # Backend raised: the command was attempted but produced no exit code.
+        raised = execute_tool.invoke({"command": "echo test", "runtime": rt})
+        assert raised.status == "error"
+        assert raised.artifact is None
 
     def test_execute_tool_output_formatting_with_truncation(self):
         """Test execute tool formats truncated output correctly."""
@@ -2956,25 +3382,225 @@ class TestFilesystemMiddleware:
 
         preview = _create_content_preview(content_str)
 
+        assert preview.lines_omitted is should_truncate
         if should_truncate:
             # Should have truncation notice
-            assert "truncated" in preview
+            assert "truncated" in preview.text
             # Should have head lines (0-4)
-            assert "line 0" in preview
-            assert "line 4" in preview
+            assert "line 0" in preview.text
+            assert "line 4" in preview.text
             # Should have tail lines
-            assert f"line {num_lines - 5}" in preview
-            assert f"line {num_lines - 1}" in preview
+            assert f"line {num_lines - 5}" in preview.text
+            assert f"line {num_lines - 1}" in preview.text
             # Should NOT have middle lines
             if num_lines > 11:
-                assert "line 5" not in preview
-                assert f"line {num_lines - 6}" not in preview
+                assert "line 5" not in preview.text
+                assert f"line {num_lines - 6}" not in preview.text
         else:
             # Should NOT have truncation notice
-            assert "truncated" not in preview
+            assert "truncated" not in preview.text
             # Should have all lines
             for i in range(num_lines):
-                assert f"line {i}" in preview
+                assert f"line {i}" in preview.text
+
+
+class TestPreviewNote:
+    def test_explains_marker_when_preview_omits_lines(self):
+        assert _preview_note(lines_omitted=True) == (
+            "Here is a preview showing the head and tail of the result "
+            "(lines of the form `... [N lines truncated] ...` indicate omitted lines in the middle of the content):"
+        )
+
+    def test_omits_marker_explanation_when_nothing_omitted(self):
+        assert _preview_note(lines_omitted=False) == "Here is a preview of the result:"
+
+    def test_custom_subject(self):
+        assert _preview_note(lines_omitted=False, subject="content") == "Here is a preview of the content:"
+
+    def test_explains_per_line_clipping(self):
+        assert _preview_note(lines_omitted=False, lines_clipped=True) == (
+            f"Here is a preview of the result (the output contains lines longer than {PREVIEW_LINE_CHAR_LIMIT} characters; "
+            f"this preview shows only their first {PREVIEW_LINE_CHAR_LIMIT} characters):"
+        )
+
+    def test_explains_both_kinds_of_loss(self):
+        """Exact wording, so a separator or ordering change is a deliberate edit."""
+        assert _preview_note(lines_omitted=True, lines_clipped=True) == (
+            "Here is a preview showing the head and tail of the result "
+            "(lines of the form `... [N lines truncated] ...` indicate omitted lines "
+            f"in the middle of the content; the output contains lines longer than {PREVIEW_LINE_CHAR_LIMIT} "
+            f"characters; this preview shows only their first {PREVIEW_LINE_CHAR_LIMIT} characters):"
+        )
+
+    def test_clipping_in_the_tail_is_reported(self):
+        """Clipping in the tail must be reported too.
+
+        A long *last* line is the common `.jsonl`/log shape, so the tail half of the
+        clipping check has to be live or its loss goes undisclosed.
+        """
+        content = "\n".join([f"line {i}" for i in range(20)] + ["Z" * (PREVIEW_LINE_CHAR_LIMIT + 1)])
+        preview = _create_content_preview(content)
+
+        assert preview.lines_omitted is True
+        assert preview.lines_clipped is True
+
+    def test_line_at_exactly_the_limit_is_not_reported_as_clipped(self):
+        """A line exactly at the limit is not clipped.
+
+        `PREVIEW_LINE_CHAR_LIMIT` characters survive whole, so claiming loss here
+        would be the same untruth as omitting a caveat, in the other direction.
+        """
+        assert _create_content_preview("C" * PREVIEW_LINE_CHAR_LIMIT).lines_clipped is False
+        assert _create_content_preview("C" * (PREVIEW_LINE_CHAR_LIMIT + 1)).lines_clipped is True
+
+    def test_offloaded_tool_message_explains_both_losses_together(self):
+        """Both caveats must be reachable from a real preview.
+
+        Otherwise the combined wording is only ever verified against hand-set flags.
+        """
+        backend, _ = _make_backend()
+        middleware = FilesystemMiddleware(backend=backend, tool_token_limit_before_evict=10)
+        content = "\n".join([f"line {i}" for i in range(20)] + ["Z" * (PREVIEW_LINE_CHAR_LIMIT + 1)])
+        tool_message = ToolMessage(content=content, tool_call_id="test_both")
+
+        result = middleware._intercept_large_tool_result(tool_message)
+
+        assert isinstance(result, ToolMessage)
+        assert "lines of the form" in result.content
+        assert f"this preview shows only their first {PREVIEW_LINE_CHAR_LIMIT} characters" in result.content
+
+    def test_marker_explanation_quotes_the_shared_template(self):
+        """The shape the note describes comes from the marker's single source of truth."""
+        assert TRUNCATION_MARKER_TEMPLATE.format(omitted_lines="N") in _preview_note(lines_omitted=True)
+
+    def test_literal_marker_in_content_does_not_claim_omission(self):
+        """Content that literally contains a marker is not mistaken for a truncated preview."""
+        content = "header\n... [42 lines truncated] ...\nfooter"
+        preview = _create_content_preview(content)
+
+        assert preview.lines_omitted is False
+        assert _preview_note(lines_omitted=preview.lines_omitted) == "Here is a preview of the result:"
+        # The literal marker survives verbatim in the rendered preview -- with a
+        # line-number gutter, unlike an inserted marker, and with contiguous
+        # numbering that shows nothing was dropped.
+        assert "2  ... [42 lines truncated] ..." in preview.text
+
+    def test_offloaded_tool_message_discloses_clipping_for_one_long_line(self):
+        """A single huge line omits no lines, but the preview still loses most of it."""
+        backend, _ = _make_backend()
+        middleware = FilesystemMiddleware(backend=backend, tool_token_limit_before_evict=10)
+        tool_message = ToolMessage(content="x" * 5000, tool_call_id="test_short")
+
+        result = middleware._intercept_large_tool_result(tool_message)
+
+        assert isinstance(result, ToolMessage)
+        # No lines were dropped, so no marker is explained...
+        assert "lines of the form" not in result.content
+        # ...but ~4000 characters were clipped away, and the note says so rather
+        # than presenting the excerpt as the whole result.
+        assert f"this preview shows only their first {PREVIEW_LINE_CHAR_LIMIT} characters" in result.content
+
+    def test_offloaded_tool_message_explains_marker_when_lines_dropped(self):
+        backend, _ = _make_backend()
+        middleware = FilesystemMiddleware(backend=backend, tool_token_limit_before_evict=10)
+        tool_message = ToolMessage(content="\n".join(f"line {i}" for i in range(50)), tool_call_id="test_long")
+
+        result = middleware._intercept_large_tool_result(tool_message)
+
+        assert isinstance(result, ToolMessage)
+        assert "Here is a preview showing the head and tail of the result" in result.content
+        assert "lines of the form" in result.content
+        # Short lines, so nothing was clipped and that caveat stays out.
+        assert "this preview shows only their first" not in result.content
+
+
+class TestTruncatedHumanMessage:
+    """The truncated-human-message stub describes *content*, not a tool *result*."""
+
+    def test_explains_marker_and_names_content_as_the_subject(self):
+        message = HumanMessage(content="\n".join(f"line {i}" for i in range(50)), id="h1")
+
+        result = _build_truncated_human_message(message, "/evicted/h1")
+
+        assert "Here is a preview showing the head and tail of the content" in result.content
+        assert "lines of the form" in result.content
+        # The subject is "content" -- an evicted human message is not a result.
+        assert "head and tail of the result" not in result.content
+
+    def test_omits_marker_explanation_when_nothing_omitted(self):
+        message = HumanMessage(content="alpha\nbeta\ngamma", id="h2")
+
+        result = _build_truncated_human_message(message, "/evicted/h2")
+
+        assert "Here is a preview of the content:" in result.content
+        assert "lines of the form" not in result.content
+
+    def test_discloses_clipping_for_one_long_line(self):
+        message = HumanMessage(content="y" * 5000, id="h3")
+
+        result = _build_truncated_human_message(message, "/evicted/h3")
+
+        assert f"this preview shows only their first {PREVIEW_LINE_CHAR_LIMIT} characters" in result.content
+        assert "of the content (" in result.content
+
+
+class TestTooLargeToolMessage:
+    def test_render_helper_pairs_note_with_its_own_preview(self):
+        rendered = _render_too_large_tool_msg(
+            tool_call_id="call_1",
+            file_path="/large_tool_results/call_1",
+            content_str="\n".join(f"line {i}" for i in range(50)),
+        )
+
+        assert "call_1" in rendered
+        assert "/large_tool_results/call_1" in rendered
+        assert "lines of the form" in rendered
+        assert "lines truncated] ..." in rendered
+
+
+class TestLargeResultTemplateDeprecation:
+    """Legacy public templates keep their released contract while warning."""
+
+    def test_tool_template_import_warns_and_preserves_formatting(self) -> None:
+        with warnings.catch_warnings(record=True) as caught:
+            warnings.simplefilter("always")
+            from deepagents.middleware.filesystem import TOO_LARGE_TOOL_MSG  # noqa: PLC0415  # verifies legacy import
+
+        rendered = TOO_LARGE_TOOL_MSG.format(
+            tool_call_id="call_1",
+            file_path="/large_tool_results/call_1",
+            content_sample="preview",
+        )
+
+        assert "call_1" in rendered
+        assert "/large_tool_results/call_1" in rendered
+        assert rendered.endswith("preview\n")
+        self._assert_deprecation(caught, "TOO_LARGE_TOOL_MSG")
+
+    def test_human_template_import_warns_and_preserves_formatting(self) -> None:
+        with warnings.catch_warnings(record=True) as caught:
+            warnings.simplefilter("always")
+            from deepagents.middleware.filesystem import TOO_LARGE_HUMAN_MSG  # noqa: PLC0415  # verifies legacy import
+
+        rendered = TOO_LARGE_HUMAN_MSG.format(
+            file_path="/large_tool_results/message_1",
+            content_sample="preview",
+        )
+
+        assert "/large_tool_results/message_1" in rendered
+        assert rendered.endswith("preview\n")
+        self._assert_deprecation(caught, "TOO_LARGE_HUMAN_MSG")
+
+    @staticmethod
+    def _assert_deprecation(caught: list[warnings.WarningMessage], name: str) -> None:
+        deprecations = [warning for warning in caught if issubclass(warning.category, DeprecationWarning)]
+
+        assert len(deprecations) == 1
+        assert deprecations[0].category is LangChainDeprecationWarning
+        assert name in str(deprecations[0].message)
+        assert "deepagents==0.7.7" in str(deprecations[0].message)
+        assert "deepagents==0.9.0" in str(deprecations[0].message)
+        assert deprecations[0].filename == __file__
 
 
 class TestExtractTextFromMessage:
@@ -3102,6 +3728,7 @@ class TestPatchToolCallsMiddleware:
         assert patched_messages[3].type == "tool"
         assert patched_messages[3].name == "get_events_for_days"
         assert patched_messages[3].tool_call_id == "123"
+        assert patched_messages[3].status == "error"
         assert patched_messages[4].type == "human"
         assert patched_messages[4].content == "What is the weather in Tokyo?"
 
@@ -3189,6 +3816,22 @@ class TestTruncation:
         # Last item should be the truncation message
         assert "results truncated" in result[-1]
         assert "try being more specific" in result[-1]
+
+    def test_truncate_list_result_accounts_for_rendering(self):
+        # Many short paths: the repr overhead alone pushes the rendered list over budget.
+        paths = [f"/{index:04x}" for index in range(10_000)]
+        result = truncate_if_too_long(paths)
+
+        assert len(str(result)) <= TOOL_RESULT_TOKEN_LIMIT * 4
+        assert result[-1] == TRUNCATION_GUIDANCE
+
+    def test_truncate_list_result_uneven_item_lengths(self):
+        # A single oversized leading item must not be retained whole.
+        paths = ["/" + "x" * (TOOL_RESULT_TOKEN_LIMIT * 4), *[f"/{index}.py" for index in range(100)]]
+        result = truncate_if_too_long(paths)
+
+        assert len(str(result)) <= TOOL_RESULT_TOKEN_LIMIT * 4
+        assert result == [TRUNCATION_GUIDANCE]
 
     def test_truncate_string_result_no_truncation(self):
         content = "short content"
@@ -3501,3 +4144,33 @@ class TestBuiltinTruncationTools:
 
         with pytest.raises(ValueError, match="max_execute_timeout must be positive"):
             FilesystemMiddleware(max_execute_timeout=-1)
+
+
+class TestGlobTruncationNoteMatchesTheCause:
+    """The remedy differs by cause, so the note must not assert the wrong one."""
+
+    def test_budget_truncation_advises_narrowing(self):
+        content = _format_glob_tool_result(["/a.py"], truncated=True, truncation_reason="budget")
+
+        assert "Narrow the search" in content
+
+    def test_unreadable_truncation_does_not_advise_narrowing(self):
+        """Narrowing can never surface files under a directory we cannot read.
+
+        Telling the model to narrow here sends it into a retry loop that cannot
+        succeed, which is why the cause is carried through `GlobResult`.
+        """
+        content = _format_glob_tool_result(["/a.py"], truncated=True, truncation_reason="unreadable")
+
+        assert "could not be read" in content
+        assert "will NOT reveal" in content
+
+    def test_unknown_cause_falls_back_to_the_generic_note(self):
+        content = _format_glob_tool_result(["/a.py"], truncated=True, truncation_reason=None)
+
+        assert "Narrow the search" in content
+
+    def test_complete_result_has_no_note(self):
+        content = _format_glob_tool_result(["/a.py"], truncated=False)
+
+        assert "Note:" not in content

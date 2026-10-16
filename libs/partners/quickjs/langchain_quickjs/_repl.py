@@ -14,9 +14,15 @@ import logging
 import threading
 import uuid
 from dataclasses import dataclass, field, replace
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, get_type_hints
 
+from langchain_core.tools.base import (
+    InjectedToolCallId,
+    _is_injected_arg_type,
+    get_all_basemodel_annotations,
+)
 from langgraph.errors import GraphInterrupt
+from langgraph.prebuilt.tool_node import _get_all_injected_args
 from quickjs_rs import (
     UNDEFINED,
     ConcurrentEvalError,
@@ -54,7 +60,7 @@ if TYPE_CHECKING:
 
 logger = logging.getLogger(__name__)
 
-_MAX_TASK_CALLS_PER_THREAD = 32
+_DEFAULT_MAX_SUBAGENT_CONCURRENCY = 32
 _TASK_FUNCTION_NAME = "task"
 
 
@@ -125,6 +131,13 @@ class _PTCState:
     remaining_calls: int | None
     outer_runtime: ToolRuntime | None = None
     outer_loop: asyncio.AbstractEventLoop | None = None
+    task_dispatch_count: int = 0
+    """Ordinal for the next `task()` dispatch in this eval.
+
+    Starts at 0 for every eval, so a replayed eval that dispatches in the
+    same order reproduces the same ordinals and therefore the same derived
+    dispatch ids.
+    """
 
     def consume_call_budget(
         self, *, function_name: str, max_ptc_calls: int | None
@@ -231,14 +244,7 @@ def _normalize_tool_input(raw: Any) -> dict[str, Any]:
 
 
 def _synth_tool_call_id(tool_name: str) -> str:
-    """Mint a synthetic tool_call_id for a PTC-driven tool invocation.
-
-    Tools like `task` require a non-empty `tool_call_id` to stamp
-    into their emitted `ToolMessage`. The real call_id lives on the
-    outer `eval` tool call; we synthesise a child id so downstream
-    state (checkpointer, tracing) can correlate the PTC sub-call back
-    to the REPL cell that issued it.
-    """
+    """Mint a synthetic tool_call_id for a PTC-driven tool invocation."""
     return f"ptc_{tool_name}_{uuid.uuid4().hex[:8]}"
 
 
@@ -259,13 +265,6 @@ def _inject_tool_args_for_ptc(
     `BaseTool.arun(..., tool_call_id=...)` at the bridge site.
     """
     enriched = dict(payload)
-
-    try:
-        from langgraph.prebuilt.tool_node import (  # noqa: PLC0415 — optional dep, imported here so ImportError is catchable
-            _get_all_injected_args,
-        )
-    except ImportError:  # pragma: no cover — langgraph always present
-        return enriched
 
     injected = _get_all_injected_args(tool)
     if not injected or outer_runtime is None:
@@ -305,48 +304,13 @@ def _inject_tool_args_for_ptc(
 
 
 def _tool_uses_injected_tool_call_id(tool: Any) -> bool:
-    """Return whether *tool* declares an `InjectedToolCallId` parameter.
-
-    PTC invokes tools with an args dict via `BaseTool.arun`. Tools that
-    declare `InjectedToolCallId` need `tool_call_id` passed as a kwarg
-    so `BaseTool._parse_input`'s built-in injection runs. Detect via the
-    same combination of schema annotations and `get_type_hints` that
-    langgraph's `_get_all_injected_args` uses.
-
-    Trade-off: passing `tool_call_id` as a kwarg makes
-    `BaseTool._format_output` wrap the result in a `ToolMessage` with
-    string-coerced `.content` (unless the tool returns a `ToolOutputMixin`
-    such as `Command`). For tools without this annotation we pass
-    `tool_call_id=None` and recover the native return value.
-    """
-    try:
-        from typing import get_type_hints  # noqa: PLC0415
-
-        from langchain_core.tools.base import (  # noqa: PLC0415
-            InjectedToolCallId,
-            _is_injected_arg_type,
-            get_all_basemodel_annotations,
-        )
-    except ImportError:  # pragma: no cover — both deps are required at runtime
-        return False
-
-    try:
-        schema_annotations = get_all_basemodel_annotations(tool.get_input_schema())
-    except Exception:  # noqa: BLE001 — schema introspection is best-effort
-        schema_annotations = {}
+    """Return whether a tool declares an injected tool call ID."""
+    schema_annotations = get_all_basemodel_annotations(tool.get_input_schema())
     func = getattr(tool, "func", None) or getattr(tool, "coroutine", None)
-    try:
-        func_annotations = (
-            get_type_hints(func, include_extras=True) if func is not None else {}
-        )
-    except Exception:  # noqa: BLE001 — type-hint resolution is best-effort
-        func_annotations = {}
-
-    # Match langgraph's merge order: schema annotations override func ones.
-    all_annotations = {**func_annotations, **schema_annotations}
+    func_annotations = get_type_hints(func, include_extras=True) if func else {}
     return any(
         _is_injected_arg_type(type_, injected_type=InjectedToolCallId)
-        for type_ in all_annotations.values()
+        for type_ in {**func_annotations, **schema_annotations}.values()
     )
 
 
@@ -395,6 +359,7 @@ class _ThreadREPL:
         max_stdout_chars: int,
         max_ptc_calls: int | None = 256,
         subagents_enabled: bool = True,
+        max_subagent_concurrency: int = _DEFAULT_MAX_SUBAGENT_CONCURRENCY,
     ) -> None:
         self._worker = worker
         self._runtime = runtime
@@ -407,6 +372,7 @@ class _ThreadREPL:
         # Static budget config; mutable counters live in `_ptc_state`.
         self._max_ptc_calls = max_ptc_calls
         self._subagents_enabled = subagents_enabled
+        self._max_subagent_concurrency = max_subagent_concurrency
         self._console = _ConsoleBuffer(max_stdout_chars)
         self._ctx: Context | None = None
         # PTC state. `_registered_tools` tracks which camel-case names
@@ -440,7 +406,7 @@ class _ThreadREPL:
         if self._capture_console:
             self._install_console()
         if self._subagents_enabled:
-            self._task_calls = asyncio.Semaphore(_MAX_TASK_CALLS_PER_THREAD)
+            self._task_calls = asyncio.Semaphore(self._max_subagent_concurrency)
             self._register_task_bridge()
 
     def _require_ctx(self) -> Context:
@@ -572,6 +538,7 @@ class _ThreadREPL:
         payload: dict[str, Any],
         *,
         state: _PTCState,
+        dispatch_ordinal: int,
     ) -> Any:
         """Validate JS `task()` input and invoke the runner on the right loop.
 
@@ -598,6 +565,7 @@ class _ThreadREPL:
                 response_schema=response_schema,
                 runtime=runtime,
                 label=label,
+                dispatch_ordinal=dispatch_ordinal,
             )
 
         outer_loop = state.outer_loop
@@ -628,11 +596,14 @@ class _ThreadREPL:
                 raise RuntimeError(msg)
 
             payload = _normalize_tool_input(raw_input)
+            dispatch_ordinal = state.task_dispatch_count
+            self._ptc_state = replace(state, task_dispatch_count=dispatch_ordinal + 1)
             async with task_calls:
                 try:
                     result = await self._ainvoke_task_on_outer_loop(
                         payload,
                         state=state,
+                        dispatch_ordinal=dispatch_ordinal,
                     )
                 except GraphInterrupt:
                     raise
@@ -658,23 +629,27 @@ class _ThreadREPL:
         tool: BaseTool,
         tool_call: dict[str, Any],
         *,
+        outer_runtime: ToolRuntime | None,
         outer_loop: asyncio.AbstractEventLoop | None,
     ) -> Any:
-        """Run the tool on the outer runtime's loop when available.
-
-        Uses `BaseTool.arun(args, tool_call_id=...)` rather than
-        `ainvoke(envelope)` so the result is the tool's native return
-        value rather than a string-coerced `ToolMessage`. We only pass
-        `tool_call_id` when the tool declares `InjectedToolCallId` —
-        otherwise `_format_output` would wrap the result anyway.
-        """
+        """Run the tool with the outer runtime's loop and config when available."""
         args = tool_call["args"]
-        tool_call_id = (
-            tool_call.get("id") if _tool_uses_injected_tool_call_id(tool) else None
-        )
+        tool_call_id = tool_call.get("id")
 
         async def _call() -> Any:
-            return await tool.arun(args, tool_call_id=tool_call_id)
+            return await tool.arun(
+                args,
+                callbacks=(
+                    outer_runtime.config.get("callbacks")
+                    if outer_runtime is not None
+                    else None
+                ),
+                run_id=uuid.uuid4(),
+                config=outer_runtime.config if outer_runtime is not None else None,
+                tool_call_id=(
+                    tool_call_id if _tool_uses_injected_tool_call_id(tool) else None
+                ),
+            )
 
         if outer_loop is None:
             return await _call()
@@ -718,18 +693,17 @@ class _ThreadREPL:
             self._ptc_state = state
             payload = _normalize_tool_input(raw_input)
             call_id = _synth_tool_call_id(tool.name)
-            # Inject runtime/state/store ourselves; `InjectedToolCallId`
-            # is handled inside `_ainvoke_tool_on_outer_loop` via
-            # `tool.arun(..., tool_call_id=...)`. The bridge intentionally
-            # avoids the tool-call envelope path because it wraps the
-            # result in a `ToolMessage` and string-coerces `.content`,
-            # destroying native return types (lists, dicts, numbers).
+            # Inject runtime/state/store ourselves. The bridge uses `arun`
+            # rather than the tool-call envelope path so the result can be
+            # unwrapped back to native JS-visible values after the standard
+            # tool lifecycle callbacks have fired.
             args = _inject_tool_args_for_ptc(
                 tool, payload, state.outer_runtime, call_id
             )
             result = await self._ainvoke_tool_on_outer_loop(
                 tool,
                 {"name": tool.name, "args": args, "id": call_id, "type": "tool_call"},
+                outer_runtime=state.outer_runtime,
                 outer_loop=state.outer_loop,
             )
             return coerce_tool_output_for_ptc(result)
@@ -952,6 +926,7 @@ class _Registry:
     max_stdout_chars: int
     max_ptc_calls: int | None = 256
     subagents_enabled: bool = True
+    max_subagent_concurrency: int = _DEFAULT_MAX_SUBAGENT_CONCURRENCY
     _slots: dict[str, _Slot] = field(default_factory=dict)
     _lock: threading.Lock = field(default_factory=threading.Lock)
 
@@ -1000,6 +975,7 @@ class _Registry:
             max_stdout_chars=self.max_stdout_chars,
             max_ptc_calls=self.max_ptc_calls,
             subagents_enabled=self.subagents_enabled,
+            max_subagent_concurrency=self.max_subagent_concurrency,
         )
 
         with self._lock:
@@ -1023,6 +999,7 @@ class _Registry:
             max_stdout_chars=self.max_stdout_chars,
             max_ptc_calls=self.max_ptc_calls,
             subagents_enabled=self.subagents_enabled,
+            max_subagent_concurrency=self.max_subagent_concurrency,
         )
         return _Slot(worker=worker, runtime=runtime, repl=repl)
 

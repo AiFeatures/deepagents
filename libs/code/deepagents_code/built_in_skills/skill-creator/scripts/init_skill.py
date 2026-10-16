@@ -10,7 +10,7 @@ Examples:
  init_skill.py custom-skill --path /custom/location
 
 For deepagents CLI:
- init_skill.py my-skill --path ~/.deepagents/agent/skills
+ init_skill.py my-skill --path "${DEEPAGENTS_HOME:-$HOME/.deepagents}/agent/skills"
 """
 
 import sys
@@ -274,7 +274,7 @@ def init_skill(skill_name, path):
 
     skill_md_path = skill_dir / "SKILL.md"
     try:
-        skill_md_path.write_text(skill_content)
+        skill_md_path.write_text(skill_content, encoding="utf-8")
         print("Created SKILL.md")
     except Exception as e:
         print(f"Error creating SKILL.md: {e}")
@@ -286,7 +286,9 @@ def init_skill(skill_name, path):
         scripts_dir = skill_dir / "scripts"
         scripts_dir.mkdir(exist_ok=True)
         example_script = scripts_dir / "example.py"
-        example_script.write_text(EXAMPLE_SCRIPT.format(skill_name=skill_name))
+        example_script.write_text(
+            EXAMPLE_SCRIPT.format(skill_name=skill_name), encoding="utf-8"
+        )
         example_script.chmod(0o755)
         print("Created scripts/example.py")
 
@@ -294,14 +296,16 @@ def init_skill(skill_name, path):
         references_dir = skill_dir / "references"
         references_dir.mkdir(exist_ok=True)
         example_reference = references_dir / "api_reference.md"
-        example_reference.write_text(EXAMPLE_REFERENCE.format(skill_title=skill_title))
+        example_reference.write_text(
+            EXAMPLE_REFERENCE.format(skill_title=skill_title), encoding="utf-8"
+        )
         print("Created references/api_reference.md")
 
         # Create assets/ directory with example asset placeholder
         assets_dir = skill_dir / "assets"
         assets_dir.mkdir(exist_ok=True)
         example_asset = assets_dir / "example_asset.txt"
-        example_asset.write_text(EXAMPLE_ASSET)
+        example_asset.write_text(EXAMPLE_ASSET, encoding="utf-8")
         print("Created assets/example_asset.txt")
     except Exception as e:
         print(f"Error creating resource directories: {e}")
@@ -333,7 +337,8 @@ def main():
         print(" init_skill.py my-api-helper --path skills/private")
         print(" init_skill.py custom-skill --path /custom/location")
         print("\nFor deepagents CLI:")
-        print(" init_skill.py my-skill --path ~/.deepagents/agent/skills")
+        skills_dir = "${DEEPAGENTS_HOME:-$HOME/.deepagents}/agent/skills"
+        print(f' init_skill.py my-skill --path "{skills_dir}"')
         sys.exit(1)
 
     skill_name = sys.argv[1]

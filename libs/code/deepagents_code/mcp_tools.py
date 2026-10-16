@@ -1,9 +1,16 @@
 """MCP (Model Context Protocol) tools loader.
 
-This module provides async functions to load and manage MCP servers using
-`langchain-mcp-adapters`, supporting Claude Desktop style JSON configs.
-It also supports automatic discovery of `.mcp.json` files from user-level
-and project-level locations.
+This module provides async functions to load and manage MCP servers,
+supporting Claude Desktop style JSON configs. It also supports automatic
+discovery of `.mcp.json` files from user-level and project-level locations.
+
+Connection management is FastMCP's: one `fastmcp.Client` per configured
+server, holding its transport, its auth, and — for stdio — a subprocess kept
+alive across tool calls. Turning the tools that client discovers into
+LangChain tools is `langchain.mcp`'s. What is left here is the part neither
+owns: finding config files, merging them, resolving `${VAR}` references,
+deciding which project-local servers may run at all, and reporting per-server
+status to the TUI.
 """
 
 from __future__ import annotations
@@ -14,29 +21,46 @@ import fnmatch
 import functools
 import json
 import logging
+import os
 import re
 import shutil
 from contextlib import AsyncExitStack
 from dataclasses import dataclass
+from enum import StrEnum
+from hashlib import sha256
+from itertools import starmap
 from pathlib import Path
-from typing import TYPE_CHECKING, Any, Literal, NamedTuple, TypeVar, cast, overload
+from types import MappingProxyType
+from typing import TYPE_CHECKING, Any, Literal, NamedTuple, cast, overload
 
 from deepagents_code import _env_vars
+from deepagents_code._paths import PATHS, project_paths
 from deepagents_code.mcp_config import resolve_mcp_server_env
 
 if TYPE_CHECKING:
-    from collections.abc import Awaitable, Callable, Collection, Mapping, Sequence
+    from collections.abc import (
+        Awaitable,
+        Callable,
+        Collection,
+        Mapping,
+        Sequence,
+    )
+    from typing import TextIO
 
+    import httpx2
+    from fastmcp.client import Client as FastMCPClient
+    from fastmcp.client.transports import ClientTransport
     from langchain_core.tools import BaseTool
-    from langchain_mcp_adapters.client import Connection
-    from mcp import ClientSession
 
     from deepagents_code.model_config import McpServerTrustLists
     from deepagents_code.project_utils import ProjectContext
 
 logger = logging.getLogger(__name__)
 
-_T = TypeVar("_T")
+_MCP_TOOL_NAME_RE = re.compile(r"[^A-Za-z0-9_-]+")
+_MCP_TOOL_NAME_MAX_LENGTH = 64
+_MCP_TOOL_NAME_HASH_LENGTH = 12
+_MCP_ORIGINAL_TOOL_NAME_KEY = "_deepagents_code_mcp_tool"
 
 # Maintainer note: `deepagents-talon` imports `MCPConfigError`,
 # `MCPServerInfo`, and `get_mcp_tools` from this module, and its tests construct
@@ -125,6 +149,20 @@ class MCPServerInfo:
     guidance text. Only meaningful while `status == "disabled"`.
     """
 
+    uses_oauth: bool = False
+    """`True` when this server's connection carries an OAuth provider.
+
+    Mirrors the condition that governs whether OAuth is actually used for the
+    connection: the config opted in with `auth: oauth`, or a prior login stored
+    tokens and no static `Authorization` header overrides them. Lets the TUI
+    offer re-authentication only where it would mean something — a server
+    authenticated by a static header ignores stored OAuth tokens, and a public
+    server has no OAuth flow to run.
+
+    Only meaningful while `status == "ok"`; `unauthenticated` servers are
+    already covered by `needs_attention()`.
+    """
+
     def __post_init__(self) -> None:
         """Enforce the status/error/tools consistency invariant.
 
@@ -191,285 +229,164 @@ class MCPConfigError(ValueError):
     """
 
 
-def _is_transient_session_error(exc: BaseException) -> bool:
-    """Return `True` when `exc` signals the MCP session transport is dead.
+def _server_stderr_log(server_name: str) -> TextIO:
+    """Return the sink FastMCP writes this server's stderr to.
 
-    The anyio import is guarded so an anyio rename or removal surfaces as
-    an `ImportError` at module import rather than silent mis-classification
-    at runtime. Standard-library socket/pipe/EOF errors are covered as a
-    fallback regardless of anyio's presence.
+    FastMCP's stdio transport sends server stderr to `sys.stderr` when given no
+    `log_file`. The TUI owns the terminal, so an unredirected server corrupts
+    the display. Use the null device so chatty servers cannot fill the disk,
+    even during long-running sessions. Structured MCP logs remain available
+    through `_server_log_handler`.
+
+    Args:
+        server_name: MCP server name, already validated as path-safe.
+
+    Returns:
+        An owned open handle to the null device.
+
+    Raises:
+        MCPConfigError: If `server_name` is not path-safe.
     """
-    try:
-        import anyio
-    except ImportError:  # pragma: no cover - anyio is a transitive MCP dep
-        anyio_excs: tuple[type[BaseException], ...] = ()
-    else:
-        anyio_excs = (
-            anyio.ClosedResourceError,
-            anyio.BrokenResourceError,
-            anyio.EndOfStream,
-        )
-    return isinstance(
-        exc,
-        (
-            *anyio_excs,
-            BrokenPipeError,
-            ConnectionAbortedError,
-            ConnectionResetError,
-            EOFError,
-            asyncio.IncompleteReadError,
-        ),
-    )
+    if not _SERVER_NAME_RE.fullmatch(server_name):
+        # Unreachable via `_validate_server_config`; guards the file name here
+        # too, since a server name that escaped validation would otherwise
+        # choose the path this writes to.
+        msg = f"Refusing to open a stderr log for unsafe server name {server_name!r}"
+        raise MCPConfigError(msg)
+    return Path(os.devnull).open("a", encoding="utf-8")
 
 
-@dataclass(frozen=True, slots=True)
-class _MCPSessionEntry:
-    """Cached MCP session and its close stack."""
+def _server_log_handler(server_name: str) -> Callable[[Any], Awaitable[None]]:
+    """Return a handler for the log messages `server_name` sends over MCP.
 
-    session: ClientSession
-    exit_stack: AsyncExitStack
+    MCP servers report their own diagnostics in-band, as `notifications/message`.
+    FastMCP installs a callback either way; what this adds over its default
+    handler is the server's identity — which matters once several backends are
+    mounted behind one router — and routing to this module's logger at the level
+    the server chose, so a server explaining *why* a tool failed reaches
+    `--debug` output as a structured record rather than being scraped out of its
+    stderr.
 
+    Args:
+        server_name: MCP server name used in log records.
 
-def _connection_signature(value: Any) -> Any:  # noqa: ANN401
-    """Return a stable comparison signature for MCP connection configs."""
-    from mcp.client.auth import OAuthClientProvider
+    Returns:
+        An async handler suitable for `fastmcp.Client(log_handler=...)`.
+    """
+    levels = {
+        "debug": logging.DEBUG,
+        "info": logging.INFO,
+        "notice": logging.INFO,
+        "warning": logging.WARNING,
+        "error": logging.ERROR,
+        "critical": logging.CRITICAL,
+        "alert": logging.CRITICAL,
+        "emergency": logging.CRITICAL,
+    }
 
-    if isinstance(value, dict):
-        return tuple(
-            sorted((key, _connection_signature(item)) for key, item in value.items()),
-        )
-    if isinstance(value, list | tuple):
-        return tuple(_connection_signature(item) for item in value)
-    if isinstance(value, Path):
-        return str(value)
-    if isinstance(value, OAuthClientProvider):
-        context = value.context
-        storage_path = getattr(getattr(context, "storage", None), "path", None)
-        return (
-            "oauth",
-            _connection_signature(context.server_url),
-            _connection_signature(
-                context.client_metadata.model_dump(mode="json", exclude_none=True),
-            ),
-            _connection_signature(storage_path),
-            _connection_signature(context.timeout),
-            _connection_signature(context.client_metadata_url),
-            _connection_signature(context.auth_server_url),
-            _connection_signature(context.protocol_version),
-        )
+    async def handle(message: Any) -> None:  # noqa: ANN401, RUF029 - FastMCP requires an async handler
+        level = levels.get(str(message.level).lower(), logging.INFO)
+        origin = f"{server_name}:{message.logger}" if message.logger else server_name
+        logger.log(level, "MCP server %s: %s", origin, message.data)
 
-    model_dump = getattr(value, "model_dump", None)
-    if callable(model_dump):
-        return _connection_signature(model_dump(mode="json", exclude_none=True))
-    return value
-
-
-def _connections_signature(
-    connections: dict[str, Connection],
-) -> tuple[tuple[str, Any], ...]:
-    """Return a stable signature for a full MCP connections mapping."""
-    return tuple(
-        sorted(
-            (name, _connection_signature(connection))
-            for name, connection in connections.items()
-        ),
-    )
+    return handle
 
 
 class MCPSessionManager:
-    """Lazy, per-server cache of persistent MCP sessions.
+    """Owns the router that fronts every configured MCP server.
 
-    Discovery always happens through throwaway sessions. Live sessions are
-    only created on the first real tool call inside the runtime event loop
-    so sessions stay bound to the loop that owns their subprocess/transport
-    handles, and so stdio servers are not restarted on every invocation.
+    All backends are mounted on one FastMCP router, and the tools handed to the
+    agent call through a single client in front of it. That client and the stack
+    holding the backend connections open live here, so a caller that outlives a
+    tool load can shut every server down at once.
     """
 
-    def __init__(self, *, connections: dict[str, Connection] | None = None) -> None:
-        """Initialize the session manager.
-
-        Args:
-            connections: Optional initial server connection configs.
-        """
-        self._connections: dict[str, Connection] = dict(connections or {})
-        self._entries: dict[str, _MCPSessionEntry] = {}
-        self._locks: dict[str, asyncio.Lock] = {}
+    def __init__(self) -> None:
+        """Initialize an empty manager."""
+        self._client: FastMCPClient[Any] | None = None
+        self._loads: list[tuple[FastMCPClient[Any], AsyncExitStack]] = []
+        self._cleanup_task: asyncio.Task[None] | None = None
         self._closed = False
 
-    def configure(self, connections: dict[str, Connection]) -> None:
-        """Set or validate the connection configs used by this manager.
+    @property
+    def client(self) -> FastMCPClient[Any] | None:
+        """Give back the router client, or `None` before any load."""
+        return self._client
 
-        When no sessions exist yet, `connections` overwrites the stored
-        configs unconditionally. Once any session has been created, the
-        new `connections` must produce the same signature as the stored
-        ones — otherwise this raises to prevent rebinding live sessions
-        to different transports or auth providers.
+    def adopt(self, client: FastMCPClient[Any], stack: AsyncExitStack) -> None:
+        """Take ownership of a router client and its backend connections.
+
+        A previously adopted pair is *not* closed here — closing it would tear
+        down sessions that tools from an earlier load still hold. All adopted
+        loads remain owned until `cleanup`.
 
         Args:
-            connections: Connection configs keyed by server name.
+            client: Client in front of the mounted router.
+            stack: Stack holding every backend connection open.
 
         Raises:
-            RuntimeError: If the manager is closed or reconfigured
-                incompatibly after sessions already exist.
+            RuntimeError: If the manager has already been cleaned up.
         """
         if self._closed:
             msg = "Cannot configure a closed MCP session manager"
             raise RuntimeError(msg)
-
-        if not self._entries:
-            self._connections = dict(connections)
-            return
-
-        if _connections_signature(self._connections) != _connections_signature(
-            connections,
-        ):
-            msg = "Cannot reconfigure MCP session manager after sessions are active"
-            raise RuntimeError(msg)
-        self._connections = dict(connections)
-
-    async def get_session(self, server_name: str) -> ClientSession:
-        """Return a cached session for `server_name`, creating it lazily."""
-        entry = self._entries.get(server_name)
-        if entry is not None:
-            return entry.session
-
-        lock = self._get_lock(server_name)
-        async with lock:
-            entry = self._entries.get(server_name)
-            if entry is not None:
-                return entry.session
-
-            entry = await self._create_entry(server_name)
-            self._entries[server_name] = entry
-            return entry.session
-
-    async def invalidate(
-        self,
-        server_name: str,
-        *,
-        expected_session: ClientSession | None = None,
-    ) -> None:
-        """Evict and close a cached session if it still matches `expected_session`.
-
-        Args:
-            server_name: MCP server name.
-            expected_session: Optional identity check for race-safe eviction.
-        """
-        lock = self._get_lock(server_name)
-        async with lock:
-            entry = self._entries.get(server_name)
-            if entry is None:
-                return
-            if expected_session is not None and entry.session is not expected_session:
-                return
-            self._entries.pop(server_name, None)
-            exit_stack = entry.exit_stack
-
-        await exit_stack.aclose()
+        self._client = client
+        self._loads.append((client, stack))
 
     async def cleanup(self) -> None:
-        """Close all cached sessions concurrently and reject future creation.
+        """Close the router client and every backend, rejecting later adoption.
 
-        Each server's `exit_stack.aclose()` runs with a 5 second timeout so
-        one slow stdio server cannot stall shutdown. Per-server failures
-        are logged — teardown is best-effort — but `CancelledError` is
-        re-raised so the enclosing `asyncio.gather` still cancels peers.
+        Teardown is bounded at 5 seconds so one unresponsive stdio server cannot
+        stall shutdown, and failures are logged rather than raised — but
+        `CancelledError` propagates so an enclosing gather still cancels peers.
         """
-        if self._closed and not self._entries:
-            return
-
         self._closed = True
-        names = list(self._entries)
+        if self._cleanup_task is None:
+            self._cleanup_task = asyncio.create_task(self._close_loads())
+        await _finish_cleanup(self._cleanup_task)
 
-        async def _close(server_name: str) -> None:
+    async def _close_loads(self) -> None:
+        """Retain each load until both teardown steps have been handled."""
+        while self._loads:
+            client, stack = self._loads[-1]
             try:
-                await asyncio.wait_for(self.invalidate(server_name), timeout=5.0)
-            except TimeoutError:
-                logger.warning(
-                    "MCP session cleanup for %r timed out after 5s",
-                    server_name,
-                )
-            except (KeyboardInterrupt, SystemExit, asyncio.CancelledError):
-                raise
-            except Exception:
-                logger.warning(
-                    "MCP session cleanup for %r failed",
-                    server_name,
-                    exc_info=True,
-                )
+                await _close_mcp_resource("router client", client.close)
+            finally:
+                await _close_mcp_resource("MCP backends", stack.aclose)
+                self._loads.pop()
+        self._client = None
 
-        await asyncio.gather(*[_close(name) for name in names])
 
-    def _get_lock(self, server_name: str) -> asyncio.Lock:
-        """Return the per-server creation/eviction lock."""
-        lock = self._locks.get(server_name)
-        if lock is None:
-            lock = asyncio.Lock()
-            self._locks[server_name] = lock
-        return lock
+async def _close_mcp_resource(label: str, close: Callable[[], Awaitable[None]]) -> None:
+    """Bound teardown and isolate ordinary resource failures."""
+    try:
+        await asyncio.wait_for(close(), timeout=5.0)
+    except TimeoutError:
+        logger.warning("MCP %s cleanup timed out after 5s", label)
+    except Exception as exc:  # noqa: BLE001 - cleanup must continue without leaking error details
+        logger.warning("MCP %s cleanup failed (%s)", label, type(exc).__name__)
 
-    async def _create_entry(self, server_name: str) -> _MCPSessionEntry:
-        """Create and initialize a new cached session entry.
 
-        Args:
-            server_name: MCP server name.
+async def _finish_cleanup(task: asyncio.Task[None]) -> None:
+    """Finish owned teardown before propagating caller cancellation.
 
-        Returns:
-            A cached session entry containing the live session and close stack.
-
-        Raises:
-            RuntimeError: If the manager has already been cleaned up.
-            ValueError: If `server_name` is not configured in the manager.
-        """
-        if self._closed:
-            msg = "Cannot create an MCP session after cleanup"
-            raise RuntimeError(msg)
-
+    Raises:
+        asyncio.CancelledError: After teardown if the caller was cancelled.
+    """
+    cancelled = False
+    while not task.done():
         try:
-            connection = self._connections[server_name]
-        except KeyError as exc:
-            msg = (
-                f"Couldn't find an MCP server named '{server_name}', "
-                f"expected one of {sorted(self._connections)}"
-            )
-            raise ValueError(msg) from exc
+            await asyncio.shield(task)
+        except asyncio.CancelledError:
+            cancelled = True
+    task.result()
+    if cancelled:
+        raise asyncio.CancelledError
 
-        from langchain_mcp_adapters.sessions import create_session
 
-        exit_stack = AsyncExitStack()
-        try:
-            session = await exit_stack.enter_async_context(create_session(connection))
-            await session.initialize()
-        except BaseException:
-            # Close the partially entered stack in *this* task before
-            # propagating. `create_session` enters an AnyIO task group whose
-            # cancel scope must be exited by the task that entered it; deferring
-            # teardown to async-generator finalization on another task raises
-            # "Attempted to exit cancel scope in a different task than it was
-            # entered in". Catch `BaseException` (not just `Exception`) so a
-            # `CancelledError` — e.g. from a crashed Streamable HTTP transport
-            # task group cancelling `session.initialize()` — also triggers the
-            # in-task teardown below instead of abandoning the session. The bare
-            # `raise` re-raises the original exception unchanged, so cancellation
-            # (and any other error) always propagates regardless; widening the
-            # catch only controls whether teardown runs, not whether the error
-            # propagates.
-            try:
-                await exit_stack.aclose()
-            except Exception:
-                # An ordinary cleanup failure must not mask the original error;
-                # the session is being discarded regardless. A `CancelledError`
-                # raised *by* `aclose()` is intentionally not caught here — it
-                # supersedes the original error, matching structured-cancellation
-                # semantics where an in-flight cancellation wins.
-                logger.warning(
-                    "Failed to close a partially initialized MCP session for %r",
-                    server_name,
-                    exc_info=True,
-                )
-            raise
-
-        return _MCPSessionEntry(session=session, exit_stack=exit_stack)
+async def _close_backend_stack(stack: AsyncExitStack) -> None:
+    """Keep backend teardown alive when its owning load is cancelled."""
+    await _finish_cleanup(asyncio.create_task(stack.aclose()))
 
 
 def _resolve_server_type(server_config: Mapping[str, Any]) -> str:
@@ -929,26 +846,6 @@ def _resolve_project_config_base(project_context: ProjectContext | None) -> Path
     return find_project_root() or Path.cwd()
 
 
-def project_root_for_mcp_config_path(
-    path: Path, *, fallback: Path | None = None
-) -> Path:
-    """Infer the project root that owns a project-level MCP config path.
-
-    Args:
-        path: Project-level `.mcp.json` path.
-        fallback: Root to use as the base for relative config paths.
-
-    Returns:
-        The owning project root.
-    """
-    parent = path.parent
-    if fallback is not None and not path.is_absolute():
-        parent = fallback if str(parent) == "." else fallback / parent
-    if parent.name == ".deepagents":
-        return parent.parent
-    return parent
-
-
 def filter_trusted_project_servers(
     servers: Mapping[str, Any],
     trust_lists: McpServerTrustLists,
@@ -988,7 +885,7 @@ def filter_trusted_project_servers(
 
 
 MCP_CONFIG_DISCOVERY_PATHS: tuple[tuple[str, str], ...] = (
-    ("~/.deepagents/.mcp.json", "user-level"),
+    (PATHS.display(PATHS.profile.mcp_config_file), "user-level"),
     ("<project-root>/.deepagents/.mcp.json", "project subdir"),
     ("<project-root>/.mcp.json", "project root"),
 )
@@ -996,68 +893,253 @@ MCP_CONFIG_DISCOVERY_PATHS: tuple[tuple[str, str], ...] = (
 
 Ordered from lowest to highest precedence. Each entry is `(path, label)`
 suitable for rendering in help screens and error messages. The runtime
-discovery in `discover_mcp_configs` builds the same paths from
-`Path.home()` and `_resolve_project_config_base()`.
+discovery in `discover_mcp_config_sources` builds the same paths from the
+immutable profile snapshot and `_resolve_project_config_base()`.
+
+The two kinds of entry are not interchangeable. The user-level path is already
+resolved and abbreviated for display, evaluated once at import. The two project
+entries are templates that still carry a `<project-root>` placeholder, because
+the project root is not known until a command runs. A renderer must not
+substitute into the first or assume the other two are real paths.
 """
 
 
-def discover_mcp_configs(
+class MCPConfigScope(StrEnum):
+    """Trust provenance assigned when an MCP config candidate is discovered."""
+
+    USER = "user"
+    """The exact `.mcp.json` selected by the immutable user profile root."""
+
+    PROJECT = "project"
+    """A repository-controlled `.mcp.json` that requires project trust."""
+
+
+@dataclass(frozen=True, slots=True)
+class DiscoveredMCPConfig:
+    """An MCP config path together with its discovery trust provenance."""
+
+    path: Path
+    scope: MCPConfigScope
+    project_root: Path | None = None
+
+    def __post_init__(self) -> None:
+        """Tie `project_root` to the scope that requires it.
+
+        `project_root` is the key that project-trust approvals are recorded
+        against, so a `PROJECT` config without one would be checked against a
+        re-derived fallback root instead of failing. Rejecting the combination
+        here keeps that from degrading into "trusted against the wrong root".
+
+        Raises:
+            ValueError: If the scope and `project_root` disagree.
+        """
+        if (self.scope is MCPConfigScope.PROJECT) != (self.project_root is not None):
+            need = (
+                "requires" if self.scope is MCPConfigScope.PROJECT else "must not carry"
+            )
+            msg = f"{self.scope} MCP config {need} a project root: {self.path}"
+            raise ValueError(msg)
+
+
+class MCPConfigIdentity(StrEnum):
+    """Whether two discovered config paths are the same underlying file."""
+
+    SAME = "same"
+    """The paths are lexically equal or resolve to one file."""
+
+    DIFFERENT = "different"
+    """The paths resolve to distinct files."""
+
+    UNKNOWN = "unknown"
+    """Resolution failed, so identity could not be determined."""
+
+
+def _same_config_location(first: Path, second: Path) -> MCPConfigIdentity:
+    """Return whether two discovered paths identify the same config.
+
+    Lexically identical paths match without filesystem access. `samefile`
+    compares filesystem identity, collapsing symlink and case aliases that
+    path resolution can preserve on case-insensitive filesystems. `UNKNOWN`
+    preserves an indeterminate identity error so the caller can fail closed
+    when scopes differ rather than retaining a possibly aliased user-trusted
+    path.
+
+    Returns:
+        The identity relationship between the two paths.
+    """
+    if first == second:
+        return MCPConfigIdentity.SAME
+    try:
+        identity_match = first.samefile(second)
+    except (OSError, RuntimeError):
+        logger.warning(
+            "Could not determine whether %s and %s are the same MCP config; "
+            "the pair cannot be told apart",
+            first,
+            second,
+            exc_info=True,
+        )
+        return MCPConfigIdentity.UNKNOWN
+    return MCPConfigIdentity.SAME if identity_match else MCPConfigIdentity.DIFFERENT
+
+
+def _append_discovered_config(
+    found: list[DiscoveredMCPConfig], candidate: DiscoveredMCPConfig
+) -> None:
+    """Append a candidate, resolving collisions toward project provenance.
+
+    A collision never grants user trust and never drops a config: the same file
+    discovered twice keeps one record at project scope, and two files that
+    cannot be told apart both load at project scope.
+
+    Only project candidates can collide, because `discover_mcp_config_sources`
+    probes the single user candidate first and `found` is therefore empty when
+    it arrives. The collision branch below has no user-scope arm. A user candidate that
+    reached it would fall through and be dropped, so reject that ordering
+    instead.
+
+    Raises:
+        AssertionError: If a user candidate arrives after another entry, which
+            would mean the candidate ordering changed.
+    """
+    if candidate.scope is not MCPConfigScope.PROJECT:
+        if found:
+            msg = (
+                "The user MCP config must be discovered first; collision "
+                "handling has no user-scope branch."
+            )
+            raise AssertionError(msg)
+        found.append(candidate)
+        return
+    for index, existing in enumerate(found):
+        identity = _same_config_location(existing.path, candidate.path)
+        if identity is MCPConfigIdentity.DIFFERENT:
+            continue
+        if identity is MCPConfigIdentity.UNKNOWN and existing.scope is candidate.scope:
+            # Identity is unknown and the trust scope is the same either way,
+            # so keeping both entries changes nothing.
+            continue
+        # A configured home can equal a project root or its `.deepagents`
+        # directory. The standard project discovery provenance wins that
+        # collision so relocating the profile never self-trusts the repo's own
+        # MCP file.
+        if identity is MCPConfigIdentity.SAME:
+            # One file: move it to this discovery position so a profile
+            # collision cannot give an earlier path higher precedence.
+            if existing.scope is not candidate.scope:
+                # The user config and a project config are one file, so its
+                # servers stop being user-trusted and start asking for project
+                # approval. The user did not change anything to cause that, so
+                # say which collision did.
+                logger.warning(
+                    "MCP config %s is both the user profile config and a "
+                    "project config, so it now loads at project scope. Its "
+                    "servers require project trust approval. Set "
+                    "DEEPAGENTS_HOME to a directory outside %s to keep them "
+                    "user-trusted.",
+                    existing.path,
+                    candidate.project_root,
+                )
+            found.pop(index)
+            found.append(candidate)
+            return
+        # Identity is unknown, so these may be two distinct files. Demote the
+        # existing entry to project scope instead of dropping it: the user's
+        # servers must still load, just without user-level trust.
+        logger.warning(
+            "Demoting MCP config %s to project scope because it could not "
+            "be distinguished from %s",
+            existing.path,
+            candidate.path,
+        )
+        found[index] = DiscoveredMCPConfig(
+            existing.path,
+            MCPConfigScope.PROJECT,
+            candidate.project_root,
+        )
+        found.append(candidate)
+        return
+    found.append(candidate)
+
+
+def discover_mcp_config_sources(
     *,
     project_context: ProjectContext | None = None,
-) -> list[Path]:
-    """Find MCP config files from standard locations.
-
-    Checks the paths listed in `MCP_CONFIG_DISCOVERY_PATHS`, lowest to
-    highest precedence.
+) -> list[DiscoveredMCPConfig]:
+    """Discover MCP configs while preserving their trust scope.
 
     Args:
         project_context: Explicit project path context, if available.
 
     Returns:
-        Existing config file paths, ordered from lowest to highest precedence.
+        Existing configs in precedence order with immutable provenance.
     """
-    user_dir = Path.home() / ".deepagents"
     project_root = _resolve_project_config_base(project_context)
+    project = project_paths(project_root)
+    candidates = (
+        DiscoveredMCPConfig(PATHS.profile.mcp_config_file, MCPConfigScope.USER),
+        DiscoveredMCPConfig(
+            project.config_mcp_config_file,
+            MCPConfigScope.PROJECT,
+            project_root,
+        ),
+        DiscoveredMCPConfig(
+            project.root_mcp_config_file,
+            MCPConfigScope.PROJECT,
+            project_root,
+        ),
+    )
 
-    candidates = [
-        user_dir / ".mcp.json",
-        project_root / ".deepagents" / ".mcp.json",
-        project_root / ".mcp.json",
-    ]
-
-    found: list[Path] = []
-    for path in candidates:
+    found: list[DiscoveredMCPConfig] = []
+    for candidate in candidates:
         try:
-            if path.is_file():
-                found.append(path)
+            if candidate.path.is_file():
+                _append_discovered_config(found, candidate)
         except OSError:
-            logger.warning("Could not check MCP config %s", path, exc_info=True)
+            logger.warning(
+                "Could not check MCP config %s", candidate.path, exc_info=True
+            )
     return found
 
 
-def classify_discovered_configs(
-    config_paths: list[Path],
-) -> tuple[list[Path], list[Path]]:
-    """Split discovered config paths into user-level and project-level configs.
+@dataclass(frozen=True, slots=True)
+class MCPConfigSources:
+    """Discovered MCP configs partitioned by trust scope.
 
-    Args:
-        config_paths: Candidate config paths from discovery.
-
-    Returns:
-        Tuple of `(user_configs, project_configs)`.
+    Consumers take the views they need. Centralizing the split keeps
+    provenance from being re-derived from path shape at each call site, which
+    is how trust used to be inferred.
     """
-    user_dir = Path.home() / ".deepagents"
-    user: list[Path] = []
-    project: list[Path] = []
-    for path in config_paths:
-        try:
-            if path.resolve().is_relative_to(user_dir.resolve()):
-                user.append(path)
-            else:
-                project.append(path)
-        except (OSError, ValueError):
-            project.append(path)
-    return user, project
+
+    user_paths: tuple[Path, ...]
+    project_paths: tuple[Path, ...]
+    project_roots: Mapping[Path, Path]
+    """Trust root for each project path. Total over `project_paths`.
+
+    Read it with `[]`, never `.get(..., fallback)`. This mapping is the key
+    that project trust approvals are recorded and checked against, so a
+    re-derived fallback root would check trust against something the approval
+    was never granted for. A miss is a broken invariant and must be loud.
+    """
+
+    @classmethod
+    def from_sources(cls, found: Sequence[DiscoveredMCPConfig]) -> MCPConfigSources:
+        """Partition discovered configs by scope.
+
+        Returns:
+            The partitioned view of `found`.
+        """
+        project = [s for s in found if s.scope is MCPConfigScope.PROJECT]
+        return cls(
+            user_paths=tuple(s.path for s in found if s.scope is MCPConfigScope.USER),
+            project_paths=tuple(s.path for s in project),
+            # `DiscoveredMCPConfig` guarantees a project-scoped entry carries a
+            # root, so this mapping is total over `project_paths`. Wrapped so
+            # the frozen dataclass does not hand out a mutable dict.
+            project_roots=MappingProxyType(
+                {s.path: s.project_root for s in project if s.project_root is not None}
+            ),
+        )
 
 
 def extract_stdio_server_commands(
@@ -1405,284 +1487,137 @@ def _config_uses_env_interpolation(server_config: dict[str, Any]) -> bool:
     return any(isinstance(value, str) and "${" in value for value in scalar_values)
 
 
-async def _discover_tools(session: ClientSession) -> list[Any]:
-    """Enumerate MCP tools from `session`, paginating until exhausted.
-
-    Args:
-        session: Initialized MCP client session.
-
-    Returns:
-        Discovered MCP tool definitions.
-
-    Raises:
-        RuntimeError: If pagination never terminates within the hard safety bound.
-    """
-    cursor: str | None = None
-    tools: list[Any] = []
-    for _ in range(1000):
-        page = await session.list_tools(cursor=cursor)
-        if page.tools:
-            tools.extend(page.tools)
-        if not page.nextCursor:
-            return tools
-        cursor = page.nextCursor
-    msg = (
-        "Reached max of 1000 iterations while listing MCP tools; "
-        "server may be returning a non-terminating cursor."
-    )
-    raise RuntimeError(msg)
-
-
-def _normalize_mcp_arguments(
-    arguments: dict[str, Any],
-    input_schema: Any,  # noqa: ANN401  # raw JSON Schema dict from the MCP tool
-) -> dict[str, Any]:
-    """Drop empty-string values for optional MCP tool params.
-
-    Some MCP servers (e.g. Slack's `slack_search_public_and_private`) validate
-    optional ID-typed params with `value is not a channel ID` when the model
-    fills them in with `""` instead of omitting them. JSON-Schema-derived
-    Pydantic models happily accept `""` for `Optional[str]`, so the request
-    reaches the server and gets rejected with a generic `ToolException`.
-
-    Treat `""` for non-required string fields as "omitted" so the MCP server
-    sees the same payload it would have for a field the model genuinely
-    skipped. Required fields are passed through unchanged so the server's
-    own missing-field error path still runs when applicable.
-
-    Only `""` is normalized; `None` is left to the caller / server. Schemas
-    that declare `["string", "null"]` will see `""` dropped but `None`
-    forwarded — callers that want symmetric "no value" handling should
-    omit the kwarg explicitly.
-
-    Dropped keys are logged at debug so unexpected MCP behavior is
-    diagnosable when a tool semantically distinguishes `""` from omitted.
-
-    Args:
-        arguments: Keyword arguments collected by LangChain's tool runner.
-        input_schema: The MCP tool's `inputSchema` (raw JSON Schema dict).
-
-    Returns:
-        A new dict suitable for `session.call_tool`.
-    """
-    if not isinstance(input_schema, dict):
-        return arguments
-    required = set(input_schema.get("required") or ())
-    properties = input_schema.get("properties") or {}
-    cleaned: dict[str, Any] = {}
-    for key, value in arguments.items():
-        if value != "" or key in required:  # noqa: PLC1901  # distinguishing "" from other falsy types (0, False, []) is the point
-            cleaned[key] = value
-            continue
-        prop = properties.get(key)
-        prop_type = prop.get("type") if isinstance(prop, dict) else None
-        is_string_typed = prop_type == "string" or (
-            isinstance(prop_type, list) and "string" in prop_type
-        )
-        # Three drop conditions converge here:
-        #   - explicit string type (the original Slack-style failure mode);
-        #   - missing `type` (oneOf/anyOf/$ref or untyped — treat as ambiguous
-        #     and conservatively drop, since the server will reject `""` for
-        #     any ID-shaped slot anyway);
-        #   - key absent from `properties` entirely (model invented a field).
-        # Anything with an explicit non-string `type` is kept — `""` can't be
-        # a valid integer/bool/array so it was the model's mistake to send,
-        # and the server's own validation gives a clearer error than ours.
-        if isinstance(prop, dict) and not is_string_typed and prop_type is not None:
-            cleaned[key] = value
-    if cleaned.keys() != arguments.keys():
-        dropped = sorted(set(arguments) - set(cleaned))
-        logger.debug("MCP arg normalize: dropped empty-string keys %s", dropped)
-    return cleaned
-
-
-def _build_cached_mcp_tool(
+async def _build_mcp_tool(
     *,
     mcp_tool: Any,  # noqa: ANN401
     server_name: str,
-    session_manager: MCPSessionManager,
-    tool_name_prefix: bool,
+    client: FastMCPClient[Any],
 ) -> BaseTool:
-    """Build a `StructuredTool` backed by the cached session manager.
+    """Adapt one backend MCP tool, then badge it as this app's.
+
+    `langchain.mcp.as_langchain_tool` owns everything protocol-facing: schema
+    conversion, calling through `client`, and turning an MCP `isError` result
+    into a failed `ToolMessage` carrying the server's own content. The tool
+    keeps its original name; only the adapter receives its internal route.
 
     Args:
-        mcp_tool: MCP tool metadata object.
-        server_name: Owning MCP server name.
-        session_manager: Runtime session cache used for tool calls.
-        tool_name_prefix: Whether to prefix the LangChain tool name with the
-            server name.
+        mcp_tool: MCP tool metadata, as returned by `Client.list_tools`.
+        server_name: Owning MCP server name, recorded in metadata.
+        client: The router client the returned tool calls through.
 
     Returns:
         A LangChain `BaseTool` wrapper around the MCP tool.
+
+    Raises:
+        TypeError: If the adapter returns an unsupported tool type.
     """
-    from langchain_core.tools import StructuredTool, ToolException
-    from langchain_mcp_adapters.tools import (
-        _convert_call_tool_result,  # noqa: PLC2701
-        _handle_mcp_tool_error,  # noqa: PLC2701
+    from langchain.mcp import as_langchain_tool
+
+    routed_tool = mcp_tool.model_copy(
+        update={"name": f"{server_name.encode().hex()}_{mcp_tool.name}"}
     )
+    tool = await as_langchain_tool(routed_tool, client)
+    from langchain_core.tools import StructuredTool
+
+    if not isinstance(tool, StructuredTool):
+        msg = f"MCP adapter returned unsupported tool type {type(tool).__name__}"
+        raise TypeError(msg)
+    call = tool.coroutine
+    if call is not None:
+        from deepagents_code.mcp_middleware import normalize_mcp_arguments
+
+        async def normalized_call(**arguments: Any) -> Any:  # noqa: ANN401
+            return await call(
+                **normalize_mcp_arguments(arguments, mcp_tool.input_schema)
+            )
+
+        tool.coroutine = normalized_call
 
     original_tool_name = mcp_tool.name
-    lc_tool_name = (
-        f"{server_name}_{original_tool_name}"
-        if tool_name_prefix and server_name
-        else original_tool_name
+    tool.name = _mcp_tool_name(server_name, original_tool_name)
+    annotations = (
+        mcp_tool.annotations.model_dump(by_alias=True, exclude_none=True)
+        if mcp_tool.annotations is not None
+        else {}
     )
-
-    meta = getattr(mcp_tool, "meta", None)
-    base_meta = (
-        mcp_tool.annotations.model_dump() if mcp_tool.annotations is not None else {}
-    )
-    wrapped_meta = {"_meta": meta} if meta is not None else {}
-    metadata = {
-        **base_meta,
-        **wrapped_meta,
+    tool.metadata = {
+        **(tool.metadata or {}),
+        **annotations,
         "_deepagents_code_mcp": True,
         "_deepagents_code_mcp_server": server_name,
+        _MCP_ORIGINAL_TOOL_NAME_KEY: original_tool_name,
     }
+    return tool
 
-    def _handle_cached_mcp_tool_error(error: ToolException) -> Any:  # noqa: ANN401
-        try:
-            return _handle_mcp_tool_error(error)
-        except ToolException:
-            logger.warning(
-                "MCP tool %r failed with recoverable ToolException: %s",
-                lc_tool_name,
-                error,
-                exc_info=True,
-            )
-            return str(error) or f"{lc_tool_name} failed with no error detail"
 
-    async def coroutine(
-        # `runtime` is injected by LangChain's tool-calling plumbing.
-        # MCP tools don't use it but the kwarg must still be accepted.
-        runtime: Any = None,  # noqa: ANN401, ARG001
-        **arguments: Any,
-    ) -> Any:  # noqa: ANN401
-        from deepagents_code.mcp_auth import find_reauth_required
+def _unique_mcp_tool_names(
+    identities: Sequence[tuple[str, str]],
+) -> dict[tuple[str, str], str]:
+    """Allocate provider-safe names independently of configuration order.
 
-        arguments = _normalize_mcp_arguments(arguments, mcp_tool.inputSchema)
+    Args:
+        identities: Original server and tool name pairs.
 
-        session = await session_manager.get_session(server_name)
-        try:
-            result = await session.call_tool(original_tool_name, arguments)
-        # Re-raise control-flow/shutdown signals (CancelledError,
-        # KeyboardInterrupt, SystemExit) and ToolException unchanged. Wrapping a
-        # ToolException here would bury its actionable message (e.g. an MCP
-        # `isError` instruction like "use the X tool instead") under a generic
-        # retry wrapper; re-raising preserves it for the tool-local error
-        # handler and the model.
-        except (asyncio.CancelledError, KeyboardInterrupt, SystemExit, ToolException):
-            raise
-        except Exception as exc:
-            reauth = find_reauth_required(exc)
-            if reauth is not None:
-                await session_manager.invalidate(
-                    server_name,
-                    expected_session=session,
-                )
-                raise ToolException(str(reauth)) from exc
-            if not _is_transient_session_error(exc):
-                msg = (
-                    f"MCP tool {lc_tool_name!r} failed on server "
-                    f"{server_name!r}: {type(exc).__name__}: {exc}"
-                )
-                raise ToolException(msg) from exc
-            logger.info(
-                "MCP session for %r appears dead (%s: %s); "
-                "invalidating and retrying once",
-                server_name,
-                type(exc).__name__,
-                exc,
-            )
-            await session_manager.invalidate(
-                server_name,
-                expected_session=session,
-            )
+    Returns:
+        Unique exported names keyed by their original identities.
+    """
+    names: dict[tuple[str, str], str] = {}
+    reserved = set(starmap(_mcp_tool_name, identities))
+    used: set[str] = set()
+    for identity in sorted(identities):
+        base = _mcp_tool_name(*identity)
+        name = base
+        index = 1
+        while name in used or (name != base and name in reserved):
+            suffix = f"_{index}"
+            name = base[: _MCP_TOOL_NAME_MAX_LENGTH - len(suffix)] + suffix
+            index += 1
+        names[identity] = name
+        used.add(name)
+    return names
 
-            retry_session = await session_manager.get_session(server_name)
-            try:
-                result = await retry_session.call_tool(original_tool_name, arguments)
-            except (
-                asyncio.CancelledError,
-                KeyboardInterrupt,
-                SystemExit,
-                ToolException,
-            ):
-                raise
-            except Exception as retry_exc:  # noqa: BLE001 - wrapped into ToolException below so the agent sees it
-                try:
-                    retry_reauth = find_reauth_required(retry_exc)
-                    if retry_reauth is not None:
-                        raise ToolException(str(retry_reauth)) from retry_exc
-                    msg = (
-                        f"MCP tool {lc_tool_name!r} failed after one retry on "
-                        f"server {server_name!r}: {type(retry_exc).__name__}: "
-                        f"{retry_exc}"
-                    )
-                    raise ToolException(msg) from retry_exc
-                finally:
-                    # Invalidate the retry session last; log cleanup failure
-                    # so resource leaks are observable.
-                    try:
-                        await session_manager.invalidate(
-                            server_name,
-                            expected_session=retry_session,
-                        )
-                    except Exception:
-                        logger.warning(
-                            "Failed to invalidate retry session for %r after "
-                            "tool failure",
-                            server_name,
-                            exc_info=True,
-                        )
 
-        # On an MCP `isError=True` result the adapter's `_convert_call_tool_result`
-        # raises, and the `handle_tool_error` callback registered below converts
-        # the MCP content blocks into a `ToolMessage(status="error")`. Other
-        # expected `ToolException`s raised by this wrapper are formatted by that
-        # same tool-local handler.
-        return _convert_call_tool_result(result)
+def _mcp_tool_name(server_name: str, tool_name: str) -> str:
+    """Compose a provider-safe MCP tool name.
 
-    return StructuredTool(
-        name=lc_tool_name,
-        description=mcp_tool.description or "",
-        args_schema=mcp_tool.inputSchema,
-        coroutine=coroutine,
-        response_format="content_and_artifact",
-        metadata=metadata,
-        handle_tool_error=cast("Any", _handle_cached_mcp_tool_error),
-    )
+    Args:
+        server_name: Owning MCP server name.
+        tool_name: Server-side tool name.
+
+    Returns:
+        A deterministic name no longer than the strictest provider limit.
+    """
+    raw_name = f"{server_name}_{tool_name}"
+    sanitized = _MCP_TOOL_NAME_RE.sub("_", raw_name).strip("_") or "unnamed"
+    if sanitized == raw_name and len(sanitized) <= _MCP_TOOL_NAME_MAX_LENGTH:
+        return sanitized
+    digest = sha256(f"{server_name}\0{tool_name}".encode()).hexdigest()[
+        :_MCP_TOOL_NAME_HASH_LENGTH
+    ]
+    server = _MCP_TOOL_NAME_RE.sub("_", server_name).strip("_") or "unnamed"
+    tool = _MCP_TOOL_NAME_RE.sub("_", tool_name).strip("_") or "unnamed"
+    available = _MCP_TOOL_NAME_MAX_LENGTH - len(digest) - 2
+    tool_length = min(len(tool), available // 2)
+    server_length = min(len(server), available - tool_length)
+    tool_length = min(len(tool), available - server_length)
+    return f"{server[:server_length]}_{tool[:tool_length]}_{digest}"
 
 
 _GLOB_METACHARS = frozenset("*?[")
 
 
-def _entry_matches_tool(entry: str, tool_name: str, prefix: str) -> bool:
-    """Return True if a single filter entry matches a tool name.
-
-    An entry containing `*`, `?`, or `[` is treated as an `fnmatch`-style glob;
-    otherwise it is matched literally. Each entry is tried against both the
-    bare MCP tool name and the server-prefixed form (`f"{prefix}{tool}"`), so
-    users can write either `read_*` or `fs_read_*`.
-
-    Args:
-        entry: Filter list entry from `allowedTools` / `disabledTools`.
-        tool_name: Adapter-supplied tool name (already server-prefixed).
-        prefix: Server prefix (`f"{server_name}_"`).
-
-    Returns:
-        True if the entry matches this tool under either match mode.
-    """
-    is_glob = any(ch in _GLOB_METACHARS for ch in entry)
-    if is_glob:
-        if fnmatch.fnmatchcase(tool_name, entry):
-            return True
-        if tool_name.startswith(prefix):
-            return fnmatch.fnmatchcase(tool_name[len(prefix) :], entry)
-        return False
-    if tool_name == entry:
-        return True
-    return tool_name.startswith(prefix) and tool_name[len(prefix) :] == entry
+def _entry_matches_tool(
+    entry: str, tool_name: str, prefix: str, original_name: str | None = None
+) -> bool:
+    """Return True if a single filter entry matches a tool name."""
+    candidates = [tool_name]
+    if original_name is not None:
+        candidates.extend((original_name, f"{prefix}{original_name}"))
+    elif tool_name.startswith(prefix):
+        candidates.append(tool_name[len(prefix) :])
+    if any(ch in _GLOB_METACHARS for ch in entry):
+        return any(fnmatch.fnmatchcase(candidate, entry) for candidate in candidates)
+    return entry in candidates
 
 
 @overload
@@ -1735,14 +1670,15 @@ def _apply_tool_filter(
     prefix = f"{server_name}_"
     field_name = "allowedTools" if allowed is not None else "disabledTools"
 
-    def _any_entry_matches(tool_name: str, entry_list: list[str]) -> bool:
-        return any(_entry_matches_tool(e, tool_name, prefix) for e in entry_list)
+    def _original_name(tool: BaseTool) -> str | None:
+        metadata = tool.metadata or {}
+        value = metadata.get(_MCP_ORIGINAL_TOOL_NAME_KEY)
+        return value if isinstance(value, str) else None
 
-    missing = [
-        e
-        for e in entries
-        if not any(_entry_matches_tool(e, t.name, prefix) for t in tools)
-    ]
+    def _matches(entry: str, tool: BaseTool) -> bool:
+        return _entry_matches_tool(entry, tool.name, prefix, _original_name(tool))
+
+    missing = [e for e in entries if not any(_matches(e, tool) for tool in tools)]
     if missing:
         logger.warning(
             "MCP server '%s' %s entries matched no tools: %s",
@@ -1752,8 +1688,12 @@ def _apply_tool_filter(
         )
 
     if allowed is not None:
-        return [t for t in tools if _any_entry_matches(t.name, entries)]
-    return [t for t in tools if not _any_entry_matches(t.name, entries)]
+        return [
+            tool for tool in tools if any(_matches(entry, tool) for entry in entries)
+        ]
+    return [
+        tool for tool in tools if not any(_matches(entry, tool) for entry in entries)
+    ]
 
 
 _MCP_LOAD_CONCURRENCY = 8
@@ -1767,17 +1707,15 @@ spawn an unbounded number of simultaneous socket/subprocess handshakes (or
 
 
 def _warm_mcp_adapter_imports() -> None:
-    """Eagerly import MCP modules whose first import may block.
+    """Warm MCP imports and lazy filesystem-backed caches off the event loop.
 
     Run via `asyncio.to_thread` before adapter/auth symbols are used, so any
     blocking side effect of a first import happens off the server event loop
-    rather than where Blockbuster would reject it. Two known offenders:
-
-    - `langchain_mcp_adapters` runs a package-resource scan on first import.
-    - `mcp_auth` imports `httpx`, which transitively imports `rich`; `rich`
-      calls `os.getcwd()` in its module body (verified against the pinned
-      versions — the exact culprit may shift as dependencies change, but the
-      general risk of import-time I/O in this subtree does not).
+    rather than where Blockbuster would reject it. The known offender is
+    `mcp_auth`, which imports `httpx`, which transitively imports `rich`;
+    `rich` calls `os.getcwd()` in its module body (verified against the pinned
+    versions — the exact culprit may shift as dependencies change, but the
+    general risk of import-time I/O in this subtree does not).
 
     Warming `mcp_auth` is best-effort: it is only *used* on per-server paths
     (remote-server preflight and the per-tool call path), where an import
@@ -1786,10 +1724,18 @@ def _warm_mcp_adapter_imports() -> None:
     import `mcp_auth` otherwise — so it is swallowed here and left to re-raise
     at the real use site. Runs only when at least one active MCP server exists.
     """
-    from langchain_mcp_adapters import (
-        sessions as _sessions,  # noqa: F401
-        tools as _tools,  # noqa: F401
+    from importlib import import_module
+
+    from fastmcp.server.dependencies import is_docket_available
+    from langchain_core._api import (  # noqa: PLC2701
+        suppress_langchain_beta_warning,
     )
+
+    import_module("jsonschema")
+    is_docket_available()
+
+    with suppress_langchain_beta_warning():
+        from langchain import mcp as _langchain_mcp  # noqa: F401
 
     try:
         from deepagents_code import mcp_auth as _mcp_auth  # noqa: F401
@@ -1801,11 +1747,11 @@ def _warm_mcp_adapter_imports() -> None:
         )
 
 
-async def _gather_bounded(
-    factories: Sequence[Callable[[], Awaitable[_T]]],
+async def _gather_bounded[T](
+    factories: Sequence[Callable[[], Awaitable[T]]],
     *,
     limit: int,
-) -> list[_T]:
+) -> list[T]:
     """Await coroutine factories with bounded concurrency, preserving order.
 
     Results are returned in submission order (not completion order), so callers
@@ -1830,7 +1776,7 @@ async def _gather_bounded(
     """
     semaphore = asyncio.Semaphore(max(1, limit))
 
-    async def _run(factory: Callable[[], Awaitable[_T]]) -> _T:
+    async def _run(factory: Callable[[], Awaitable[T]]) -> T:
         async with semaphore:
             return await factory()
 
@@ -1854,15 +1800,255 @@ async def _gather_bounded(
         raise
 
 
+def _build_transport(
+    server_name: str,  # noqa: ARG001 - retained for transport factory callers
+    server_type: str,
+    server_config: Mapping[str, Any],
+    *,
+    auth: httpx2.Auth | None,
+    keep_alive: bool,
+    cwd: str | None = None,
+) -> ClientTransport:
+    """Build the FastMCP transport for one configured server.
+
+    The config entry is handed to FastMCP's own server models, so their
+    validation is what rejects a malformed entry and their `to_transport` is
+    what picks the transport class — including resolving a bare `url` to
+    streamable-HTTP or SSE.
+
+    Stderr handles are prepared off the event loop when mounting, where their
+    lifetime can be tied to the backend stack.
+
+    Args:
+        server_name: MCP server name, used to validate the stderr sink.
+        server_type: Resolved transport type (`stdio`, `http`, or `sse`).
+        server_config: That server's config, with `${VAR}` refs already resolved.
+        auth: OAuth provider to attach, for a remote server that uses one.
+        keep_alive: Whether a stdio server's subprocess outlives one connection.
+            A live client reuses it across tool calls; a stateless load does not.
+        cwd: Session directory used when a stdio server has no configured cwd.
+
+    Returns:
+        A transport ready to mount on the router.
+    """
+    from fastmcp.mcp_config import RemoteMCPServer, StdioMCPServer
+
+    if server_type in _SUPPORTED_REMOTE_TYPES:
+        # Only pin the transport when the config actually named one. Left unset,
+        # FastMCP infers it from the URL, which is what makes a bare
+        # `{"url": ".../sse"}` entry connect over SSE instead of streamable HTTP.
+        declared = server_config.get("type") or server_config.get("transport")
+        remote_config = dict(server_config)
+        remote_config["transport"] = (
+            ("sse" if server_type == "sse" else "http") if declared else None
+        )
+        remote = RemoteMCPServer.model_validate(remote_config)
+        # The config's `auth` is a mode name (`"oauth"`), not a credential; the
+        # resolved provider replaces it.
+        remote.auth = auth
+        return remote.to_transport()
+
+    stdio = StdioMCPServer.model_validate(dict(server_config))
+    stdio.keep_alive = keep_alive
+    if stdio.cwd is None:
+        stdio.cwd = cwd
+    return stdio.to_transport()
+
+
+async def _mount_backends(
+    backends: Mapping[str, ClientTransport],
+    *,
+    redact: Mapping[str, bool],
+) -> tuple[
+    FastMCPClient[Any],
+    AsyncExitStack,
+    dict[str, list[Any]],
+    dict[str, tuple[MCPServerStatus, str]],
+]:
+    """Connect, discover, and mount every backend on one router.
+
+    Discovery runs against each backend before aggregation so tool ownership and
+    per-server failures remain exact. The TUI can then identify a failed server,
+    and filters cannot be bypassed by ambiguous mounted names.
+
+    Args:
+        backends: Ready transports keyed by server name.
+        redact: Per-server flag for whether error detail may quote a config
+            that interpolates `${VAR}` references.
+
+    Returns:
+        The router client, the stack holding every backend open, discovered tools
+            keyed by server, and a `(status, error)` entry for each failed server.
+    """
+    from fastmcp import FastMCP
+    from fastmcp.client import Client as FastMCPClient
+    from fastmcp.server.providers.proxy import StatefulProxyClient
+    from fastmcp.server.server import create_proxy
+
+    from deepagents_code.mcp_proxy import MCPBackendMiddleware
+
+    router: Any = FastMCP(name="deepagents-code")
+    discovered: dict[str, list[Any]] = {}
+    failures: dict[str, tuple[MCPServerStatus, str]] = {}
+
+    from fastmcp.client.transports import StdioTransport
+
+    stack = AsyncExitStack()
+    connected: dict[str, StatefulProxyClient[Any]] = {}
+
+    async def connect(server_name: str, transport: ClientTransport) -> None:
+        owned = AsyncExitStack()
+        try:
+            if isinstance(transport, StdioTransport):
+                # Register ownership in the worker too: cancellation must not lose
+                # a handle opened after the awaiting task has been cancelled.
+                def prepare_stderr() -> None:
+                    handle = _server_stderr_log(server_name)
+                    owned.push_async_callback(asyncio.to_thread, handle.close)
+                    transport.log_file = handle
+
+                await _finish_cleanup(
+                    asyncio.create_task(asyncio.to_thread(prepare_stderr))
+                )
+            owned.push_async_callback(_close_mcp_resource, "transport", transport.close)
+            backend = StatefulProxyClient(
+                transport=transport, log_handler=_server_log_handler(server_name)
+            )
+            owned.push_async_callback(
+                _close_mcp_resource,
+                "backend client",
+                functools.partial(backend._disconnect, force=True),
+            )
+            await backend.__aenter__()  # noqa: PLC2801 - explicit forced disconnect above
+            tools = await backend.list_tools()
+            connected[server_name] = backend
+            discovered[server_name] = tools
+            stack.push_async_callback(_close_backend_stack, owned.pop_all())
+        except Exception as exc:  # noqa: BLE001 - isolate each backend
+            failures[server_name] = _classify_connect_failure(
+                server_name, exc, redact=redact.get(server_name, False)
+            )
+        finally:
+            await _close_backend_stack(owned)
+
+    try:
+        await _gather_bounded(
+            [
+                functools.partial(connect, name, transport)
+                for name, transport in backends.items()
+            ],
+            limit=_MCP_LOAD_CONCURRENCY,
+        )
+        for name in backends:
+            if name in connected:
+                proxy = create_proxy(connected[name])
+                proxy.add_middleware(MCPBackendMiddleware(connected[name]))
+                router.mount(proxy, namespace=name.encode().hex())
+        return (
+            FastMCPClient(router),
+            stack.pop_all(),
+            {name: discovered[name] for name in backends if name in discovered},
+            {name: failures[name] for name in backends if name in failures},
+        )
+    except BaseException:
+        await _close_backend_stack(stack)
+        raise
+
+
+def _classify_connect_failure(
+    server_name: str,
+    exc: BaseException,
+    *,
+    redact: bool,
+) -> tuple[MCPServerStatus, str]:
+    """Describe why a server would not connect, in the terms the TUI offers.
+
+    Two failures are worth telling apart from a generic error because the user
+    can act on them: tokens that exist but no longer refresh, and a server
+    answering an unauthenticated request with an RFC 9728 challenge. Both mean
+    "log in", so both become `unauthenticated`.
+
+    Classification is itself best-effort — a classifier that raises degrades the
+    server to a plain error rather than taking down the rest of the load.
+
+    Args:
+        server_name: MCP server name.
+        exc: The failure raised while connecting.
+        redact: Whether this server's config interpolates `${VAR}`, in which
+            case the message must not quote resolved (secret-bearing) values.
+
+    Returns:
+        The `(status, error)` pair for this server's `MCPServerInfo`.
+    """
+    from deepagents_code.mcp_auth import (
+        find_oauth_challenge,
+        find_reauth_required,
+        format_login_failure,
+    )
+
+    try:
+        reauth = find_reauth_required(exc)
+        challenge = None if reauth is not None else find_oauth_challenge(exc)
+    except Exception:
+        logger.debug(
+            "MCP server %r: failed to classify connect error",
+            server_name,
+            exc_info=True,
+        )
+        reauth = challenge = None
+
+    if reauth is not None or challenge is not None:
+        error = (
+            f"{reauth} (token refresh failed)"
+            if reauth is not None
+            else (
+                f"MCP server {server_name!r} requires authentication; "
+                f"run `dcode mcp login {server_name}`."
+            )
+        )
+        logger.warning("MCP server '%s' skipped: %s", server_name, error)
+        # An expected, already-classified outcome: the actionable WARNING says
+        # everything useful, so the DEBUG line stays a concise, token-safe
+        # breadcrumb. `format_login_failure` names the culprit nested inside the
+        # anyio `ExceptionGroup` these usually arrive wrapped in.
+        logger.debug(
+            "MCP server '%s' skipped: %s",
+            server_name,
+            format_login_failure(exc),
+        )
+        return ("unauthenticated", error)
+
+    if redact:
+        logger.warning(
+            "MCP server '%s' skipped: connection failed (%s; details redacted "
+            "because config uses environment interpolation)",
+            server_name,
+            exc.__class__.__name__,
+        )
+        return (
+            "error",
+            (
+                f"MCP server {server_name!r}: connection failed after "
+                "resolving environment variables."
+            ),
+        )
+
+    logger.warning(
+        "MCP server '%s' skipped: connection failed", server_name, exc_info=exc
+    )
+    return ("error", str(exc))
+
+
 async def _load_tools_from_config(
     config: dict[str, Any],
     *,
+    server_cwds: dict[str, str] | None = None,
     stateless: bool = False,
     session_manager: MCPSessionManager | None = None,
 ) -> tuple[list[BaseTool], MCPSessionManager | None, list[MCPServerInfo]]:
     """Build MCP connections from a validated config and load tools.
 
-    Discovery always opens throwaway sessions to capture tool metadata only.
+    Discovery sessions remain owned until the load is adopted or closed.
     Runtime tools either:
 
     - bind to a caller-managed `session_manager` (server mode),
@@ -1875,6 +2061,9 @@ async def _load_tools_from_config(
 
     Args:
         config: Validated MCP configuration dict with `mcpServers` key.
+        server_cwds: Per-server fallback directories for approved project and
+            explicitly supplied configs. Other servers inherit the backend
+            process directory; explicit server `cwd` settings take precedence.
         stateless: When `True`, tools avoid returning an owned session manager.
         session_manager: Optional externally owned runtime session manager.
 
@@ -1884,37 +2073,46 @@ async def _load_tools_from_config(
     Raises:
         RuntimeError: If `session_manager` is reconfigured incompatibly with
             sessions already active on it.
-    """  # noqa: DOC502 - `RuntimeError` surfaces via `MCPSessionManager.configure`
+    """  # noqa: DOC502 - `RuntimeError` surfaces via `MCPSessionManager.adopt`
     # Warm the adapter imports off the event loop *here* (rather than in the
     # caller) so a config with no active MCP servers — which returns before
     # ever reaching this function — never pays the adapter-import cost.
     await asyncio.to_thread(_warm_mcp_adapter_imports)
-    from langchain_mcp_adapters.sessions import (
-        SSEConnection,
-        StdioConnection,
-        StreamableHttpConnection,
-        create_session,
-    )
-    from langchain_mcp_adapters.tools import convert_mcp_tool_to_langchain_tool
 
-    server_items = list(config["mcpServers"].items())
+    # Imported here, not at module scope: pulling FastMCP in eagerly would put
+    # it on the `dcode mcp --help` startup path.
+    from fastmcp.client.transports import ClientTransport as _ClientTransport
+
+    server_items: list[tuple[str, dict[str, Any]]] = list(config["mcpServers"].items())
     # Resolve each server's transport once, up front. `_resolve_server_type` is
     # pure, so this is a readability/DRY win over recomputing it in preflight,
     # discovery, and the final fold-in loop below.
     transports = {name: _resolve_server_type(cfg) for name, cfg in server_items}
+    # Names whose connection got an OAuth provider, recorded during preflight
+    # and folded into `MCPServerInfo.uses_oauth` at discovery. Preflight fully
+    # completes before discovery starts, so this is populated by then. Computed
+    # here rather than in `_discover_server` because the decision needs the
+    # *resolved* config — the token file stem is derived from the expanded URL.
+    oauth_servers: set[str] = set()
+    # Whether each server's config interpolates `${VAR}`. Captured from the
+    # *raw* config: once refs are expanded, an error message could echo a
+    # resolved secret, so those servers' failures are reported without detail.
+    redacts = {name: _config_uses_env_interpolation(cfg) for name, cfg in server_items}
 
     async def _preflight_and_connect(
         server_name: str,
         server_config: dict[str, Any],
-    ) -> tuple[MCPServerStatus, str] | Connection:
-        """Preflight one server and build its connection config.
+    ) -> tuple[MCPServerStatus, str] | ClientTransport:
+        """Preflight one server and build its transport.
 
         Per-server preflight/config failures are captured here so one bad
-        server never aborts loading the others.
+        server never aborts loading the others. Nothing is dialed yet — the
+        transports returned here are mounted on the router below, which is
+        where connection failures are classified.
 
         Returns:
             A `(status, error)` tuple when the server must be skipped, or a
-            ready `Connection` otherwise.
+            ready transport otherwise.
         """
         server_type = transports[server_name]
         # Capture this from the *raw* config, before resolution below rebinds
@@ -1953,20 +2151,6 @@ async def _load_tools_from_config(
 
         try:
             if server_type in _SUPPORTED_REMOTE_TYPES:
-                if server_type == "http":
-                    conn: Connection = StreamableHttpConnection(
-                        transport="streamable_http",
-                        url=server_config["url"],
-                    )
-                else:
-                    conn = SSEConnection(
-                        transport="sse",
-                        url=server_config["url"],
-                    )
-
-                if "headers" in server_config:
-                    conn["headers"] = server_config["headers"]
-
                 from deepagents_code.mcp_auth import (
                     FileTokenStorage,
                     build_oauth_provider,
@@ -1993,6 +2177,7 @@ async def _load_tools_from_config(
                     )
                     return ("unauthenticated", auth_msg)
 
+                auth: httpx2.Auth | None = None
                 if explicit_oauth or (
                     stored_tokens is not None and not has_authorization_header
                 ):
@@ -2000,19 +2185,30 @@ async def _load_tools_from_config(
                     # prior login (possibly triggered by 401 auto-detection)
                     # already stored tokens for this server. Static
                     # Authorization headers take precedence over stored OAuth.
-                    conn["auth"] = build_oauth_provider(
+                    # `build_oauth_provider` returns an `httpx2.Auth`, which is
+                    # what FastMCP's remote transports take directly.
+                    oauth_servers.add(server_name)
+                    auth = build_oauth_provider(
                         server_name=server_name,
                         server_url=server_config["url"],
                         storage=storage,
                         interactive=False,
                     )
 
-                return conn
-            return StdioConnection(
-                command=server_config["command"],
-                args=server_config.get("args", []),
-                env=server_config.get("env") or None,
-                transport="stdio",
+                return _build_transport(
+                    server_name,
+                    server_type,
+                    server_config,
+                    auth=auth,
+                    keep_alive=not stateless or session_manager is not None,
+                )
+            return _build_transport(
+                server_name,
+                server_type,
+                server_config,
+                auth=None,
+                keep_alive=not stateless or session_manager is not None,
+                cwd=(server_cwds or {}).get(server_name),
             )
         except (OSError, RuntimeError, TypeError, ValueError) as exc:
             if redact_failure_details:
@@ -2048,312 +2244,187 @@ async def _load_tools_from_config(
     )
 
     skipped: dict[str, tuple[MCPServerStatus, str]] = {}
-    connections: dict[str, Connection] = {}
+    backends: dict[str, ClientTransport] = {}
     for (server_name, _server_config), result in zip(
         server_items, preflight_results, strict=True
     ):
-        if isinstance(result, tuple):
-            skipped[server_name] = result
+        if isinstance(result, _ClientTransport):
+            backends[server_name] = result
         else:
-            connections[server_name] = result
+            skipped[server_name] = result
 
-    runtime_manager: MCPSessionManager | None = session_manager
-    if runtime_manager is not None:
-        runtime_manager.configure(connections)
-    elif not stateless:
-        runtime_manager = MCPSessionManager(connections=connections)
+    runtime_manager = MCPSessionManager()
+    client, stack, by_server, mount_failures = await _mount_backends(
+        backends, redact=redacts
+    )
+    runtime_manager.adopt(client, stack)
+    skipped.update(mount_failures)
+    tool_names = _unique_mcp_tool_names(
+        [(server, tool.name) for server, tools in by_server.items() for tool in tools]
+    )
 
-    async def _discover_server(
+    async def _build_server(
         server_name: str,
         server_config: dict[str, Any],
-        transport: str,
     ) -> tuple[list[BaseTool], MCPServerInfo]:
-        """Discover one server's tools and build its `MCPServerInfo`.
+        """Adapt one server's tools and build its `MCPServerInfo`.
 
-        Both discovery failures (classified as auth vs. generic error) and
-        post-discovery tool-construction failures are captured as a non-`ok`
-        `MCPServerInfo` with no tools, so a single failing server never aborts
-        the load for the others. Cancellation/shutdown signals are re-raised so
-        the bounded runner can tear the whole load down.
+        Tool construction can still fail after a healthy connection — a schema
+        that will not convert, or a bad tool filter — so it is isolated per
+        server here, the same way connection failures are isolated at mount.
+
+        Args:
+            server_name: MCP server name.
+            server_config: That server's resolved config entry.
 
         Returns:
             The server's LangChain tools plus its `MCPServerInfo` entry.
         """  # noqa: DOC501 - CancelledError/KeyboardInterrupt/SystemExit are re-raised pass-throughs
-        redact_failure_details = _config_uses_env_interpolation(server_config)
-
-        def _log_caught_exception(
-            level: int,
-            message: str,
-            caught: BaseException,
-        ) -> None:
-            """Log a caught exception without exposing resolved config values."""
-            if redact_failure_details:
-                rendered_message = message % server_name
-                logger.log(
-                    level,
-                    "%s (%s; details redacted because config uses environment "
-                    "interpolation)",
-                    rendered_message,
-                    caught.__class__.__name__,
-                )
-            else:
-                logger.log(level, message, server_name, exc_info=caught)
-
+        redact_failure_details = redacts[server_name]
         try:
-            async with create_session(connections[server_name]) as discover_session:
-                await discover_session.initialize()
-                mcp_tools = await _discover_tools(discover_session)
-        except (asyncio.CancelledError, KeyboardInterrupt, SystemExit):
-            raise
-        except Exception as exc:  # noqa: BLE001 - isolate third-party discovery failures per server
-            from deepagents_code.mcp_auth import (
-                find_oauth_challenge,
-                find_reauth_required,
-                format_login_failure,
+            server_tools = await asyncio.gather(
+                *(
+                    _build_mcp_tool(
+                        mcp_tool=mcp_tool, server_name=server_name, client=client
+                    )
+                    for mcp_tool in by_server[server_name]
+                )
             )
-
-            status: MCPServerStatus
-            try:
-                reauth = find_reauth_required(exc)
-                challenge_url = (
-                    find_oauth_challenge(exc)
-                    if transport in _SUPPORTED_REMOTE_TYPES
-                    else None
-                )
-            except Exception as classify_exc:  # noqa: BLE001 - classification must not abort other servers
-                # Classifying the failure is best-effort. If a classifier
-                # itself raises, degrade this one server to a plain error
-                # rather than letting the exception abort tool loading for
-                # every remaining server.
-                reauth = None
-                challenge_url = None
-                _log_caught_exception(
-                    logging.DEBUG,
-                    "MCP server '%s': failed to classify discovery error",
-                    classify_exc,
-                )
-
-            if reauth is not None:
-                # Tokens existed (we checked above) but the OAuth provider
-                # fell back to interactive reauth — the refresh attempt
-                # failed. Flag unauthenticated so the user is prompted to
-                # re-login. This is an expected, already-classified outcome, so
-                # the actionable WARNING says everything useful; the full
-                # traceback adds no diagnostic value, so keep the DEBUG log to a
-                # concise, token-safe breadcrumb. Use `format_login_failure`
-                # rather than `exc.__class__.__name__`: these failures usually
-                # arrive wrapped in an anyio `ExceptionGroup`, so the bare root
-                # class name would just read "ExceptionGroup"; the helper walks
-                # the group/cause chain to name the nested culprit instead.
-                status = "unauthenticated"
-                error = f"{reauth} (token refresh failed)"
-                logger.warning(
-                    "MCP server '%s' skipped: %s",
-                    server_name,
-                    error,
-                )
-                logger.debug(
-                    "MCP server '%s' skipped: token refresh failed (%s)",
-                    server_name,
-                    format_login_failure(exc),
-                )
-            elif challenge_url is not None:
-                # A remote server answered with a 401 OAuth challenge
-                # (RFC 9728) that wasn't already handled as a token refresh —
-                # typically a server not opted into OAuth in config. Surface it
-                # as unauthenticated so the user can log in, rather than as an
-                # opaque connection error. Like the reauth case, this is a
-                # recognized outcome: keep the DEBUG log to a concise,
-                # token-safe breadcrumb (via `format_login_failure`, which
-                # names the nested culprit inside the anyio `ExceptionGroup`)
-                # rather than dumping the full challenge traceback.
-                status = "unauthenticated"
-                error = (
-                    f"MCP server {server_name!r} requires authentication; "
-                    f"run `dcode mcp login {server_name}`."
-                )
-                logger.warning(
-                    "MCP server '%s' skipped: %s",
-                    server_name,
-                    error,
-                )
-                logger.debug(
-                    "MCP server '%s' skipped: 401 OAuth challenge detected (%s)",
-                    server_name,
-                    format_login_failure(exc),
-                )
-            else:
-                status = "error"
-                error = (
-                    (
-                        f"MCP server {server_name!r}: tool discovery failed "
-                        "after resolving environment variables."
-                    )
-                    if redact_failure_details
-                    else str(exc)
-                )
-                _log_caught_exception(
-                    logging.WARNING,
-                    "MCP server '%s' skipped: tool discovery failed",
-                    exc,
-                )
-            return [], MCPServerInfo(
-                name=server_name,
-                transport=transport,
-                status=status,
-                error=error,
-            )
-
-        # Tool construction and filtering run after the discovery session has
-        # closed and can still fail (schema conversion, custom tool filters).
-        # Isolate them too so a construction error degrades this one server to
-        # an error entry instead of aborting the whole concurrent load — the
-        # same guarantee the discovery `try` above provides. Cancellation and
-        # shutdown signals still propagate so the bounded runner can tear down.
-        try:
-            if runtime_manager is None:
-                server_tools: list[BaseTool] = [
-                    convert_mcp_tool_to_langchain_tool(
-                        None,
-                        mcp_tool,
-                        connection=connections[server_name],
-                        server_name=server_name,
-                        tool_name_prefix=True,
-                    )
-                    for mcp_tool in mcp_tools
-                ]
-            else:
-                server_tools = [
-                    _build_cached_mcp_tool(
-                        mcp_tool=mcp_tool,
-                        server_name=server_name,
-                        session_manager=runtime_manager,
-                        tool_name_prefix=True,
-                    )
-                    for mcp_tool in mcp_tools
-                ]
-
+            for tool in server_tools:
+                original_name = (tool.metadata or {})[_MCP_ORIGINAL_TOOL_NAME_KEY]
+                tool.name = tool_names[server_name, original_name]
             server_tools = _apply_tool_filter(server_tools, server_name, server_config)
 
-            # Pair each tool's input_schema by its LangChain (server-prefixed)
-            # name — the same form `server_tools` carries — so the lookup needs
-            # no string surgery and stays correct if `tool_name_prefix` ever
-            # changes. Deep-copy the raw dict because `MCPToolInfo` is `frozen`
-            # but Python's `frozen=True` does not freeze nested mutables; a
-            # shared reference would let one holder mutate every other's view.
-            schemas: dict[str, dict[str, Any] | None] = {}
-            for mcp_tool in mcp_tools:
-                tool_name = getattr(mcp_tool, "name", "")
-                try:
-                    raw_schema = getattr(mcp_tool, "inputSchema", None)
-                    schema_copy = (
-                        copy.deepcopy(raw_schema) if raw_schema is not None else None
-                    )
-                except (AttributeError, TypeError, RecursionError) as exc:
-                    logger.warning(
-                        "MCP tool %r on server %r: inputSchema access raised "
-                        "%s: %s; rendering with no parameters",
-                        tool_name,
-                        server_name,
-                        exc.__class__.__name__,
-                        exc,
-                    )
-                    schema_copy = None
-                lc_name = f"{server_name}_{tool_name}"
-                schemas[lc_name] = schema_copy
+            # Pair each schema by the server-side name retained in the adapted
+            # tool's metadata. The provider-safe LangChain name may be sanitized
+            # or capped, so it cannot key this lookup reliably.
+            schemas = {
+                mcp_tool.name: copy.deepcopy(mcp_tool.input_schema)
+                for mcp_tool in by_server[server_name]
+            }
 
-            tool_infos: list[MCPToolInfo] = []
-            for tool in server_tools:
-                schema = schemas.get(tool.name)
-                if schema is None and schemas:
-                    logger.debug(
-                        "MCP tool %r on server %r: no schema matched in lookup "
-                        "(available keys: %s); rendering with no parameters",
-                        tool.name,
-                        server_name,
-                        list(schemas.keys())[:5],
-                    )
-                tool_infos.append(
-                    MCPToolInfo(
-                        name=tool.name,
-                        description=tool.description or "",
-                        input_schema=schema,
-                    ),
+            def _tool_schema(tool: BaseTool) -> dict[str, Any] | None:
+                original_name = (tool.metadata or {}).get(_MCP_ORIGINAL_TOOL_NAME_KEY)
+                return (
+                    schemas.get(original_name)
+                    if isinstance(original_name, str)
+                    else None
                 )
+
+            tool_infos = [
+                MCPToolInfo(
+                    name=tool.name,
+                    description=tool.description or "",
+                    input_schema=_tool_schema(tool),
+                )
+                for tool in server_tools
+            ]
         except (asyncio.CancelledError, KeyboardInterrupt, SystemExit):
             raise
-        except Exception as exc:  # noqa: BLE001 - isolate third-party tool conversion failures per server
+        except Exception as exc:
             error = (
-                (
-                    f"MCP server {server_name!r}: tool construction failed "
-                    "after resolving environment variables."
-                )
+                f"MCP server {server_name!r}: tool construction failed "
+                "after resolving environment variables."
                 if redact_failure_details
                 else str(exc)
             )
-            _log_caught_exception(
-                logging.WARNING,
+            logger.warning(
                 "MCP server '%s' skipped: tool construction failed",
-                exc,
+                server_name,
+                exc_info=None if redact_failure_details else exc,
             )
             return [], MCPServerInfo(
                 name=server_name,
-                transport=transport,
+                transport=transports[server_name],
                 status="error",
                 error=error,
             )
 
         return server_tools, MCPServerInfo(
             name=server_name,
-            transport=transport,
+            transport=transports[server_name],
             tools=tuple(tool_infos),
+            uses_oauth=server_name in oauth_servers,
         )
-
-    # Discovery also runs concurrently (bounded) across the servers that
-    # survived preflight. Because `_gather_bounded` returns results in
-    # submission order and skipped servers are folded back in below by
-    # iterating `server_items` in config order, `server_infos` stays in config
-    # order and the returned tools stay sorted by tool name — regardless of
-    # which server's probe finished first.
-    discover_items = [
-        (server_name, server_config, transports[server_name])
-        for server_name, server_config in server_items
-        if server_name not in skipped
-    ]
-    discovery_results = await _gather_bounded(
-        [
-            functools.partial(_discover_server, name, cfg, transport)
-            for name, cfg, transport in discover_items
-        ],
-        limit=_MCP_LOAD_CONCURRENCY,
-    )
-    discovered: dict[str, tuple[list[BaseTool], MCPServerInfo]] = {
-        server_name: result
-        for (server_name, _cfg, _transport), result in zip(
-            discover_items, discovery_results, strict=True
-        )
-    }
 
     all_tools: list[BaseTool] = []
     server_infos: list[MCPServerInfo] = []
-    for server_name, _server_config in server_items:
-        if server_name in skipped:
-            status, error = skipped[server_name]
-            server_infos.append(
-                MCPServerInfo(
-                    name=server_name,
-                    transport=transports[server_name],
-                    status=status,
-                    error=error,
-                ),
-            )
-            continue
-        server_tools, server_info = discovered[server_name]
-        all_tools.extend(server_tools)
-        server_infos.append(server_info)
+    try:
+        for server_name, server_config in server_items:
+            if server_name in skipped:
+                status, error = skipped[server_name]
+                server_infos.append(
+                    MCPServerInfo(
+                        name=server_name,
+                        transport=transports[server_name],
+                        status=status,
+                        error=error,
+                    ),
+                )
+                continue
+            server_tools, server_info = await _build_server(server_name, server_config)
+            all_tools.extend(server_tools)
+            server_infos.append(server_info)
+    except BaseException:
+        await runtime_manager.cleanup()
+        raise
 
     all_tools.sort(key=lambda tool: tool.name)
+    if session_manager is not None:
+        try:
+            session_manager.adopt(client, stack)
+        except BaseException:
+            await runtime_manager.cleanup()
+            raise
+        runtime_manager = session_manager
+    elif stateless:
+        await runtime_manager.cleanup()
+        for tool in all_tools:
+            _make_stateless_tool(tool, config, server_cwds=server_cwds)
     return all_tools, None if stateless else runtime_manager, server_infos
+
+
+def _make_stateless_tool(
+    tool: BaseTool,
+    config: dict[str, Any],
+    *,
+    server_cwds: dict[str, str] | None = None,
+) -> None:
+    """Give a tool a fresh, locally owned backend for each invocation."""
+    from langchain_core.tools import StructuredTool
+
+    if not isinstance(tool, StructuredTool):
+        return
+    server = (tool.metadata or {})["_deepagents_code_mcp_server"]
+    cwd = (server_cwds or {}).get(server)
+    server_config = copy.deepcopy(config["mcpServers"][server])
+    original = (tool.metadata or {})[_MCP_ORIGINAL_TOOL_NAME_KEY]
+    # This wrapper passed the full-config filters. A single-server reload has
+    # different exported names, so dispatch only by the authorized original.
+    server_config.pop("allowedTools", None)
+    server_config.pop("disabledTools", None)
+
+    async def call(**arguments: Any) -> Any:  # noqa: ANN401
+        tools, manager, infos = await _load_tools_from_config(
+            {"mcpServers": {server: server_config}},
+            server_cwds={server: cwd} if cwd is not None else None,
+        )
+        try:
+            for candidate in tools:
+                if (
+                    isinstance(candidate, StructuredTool)
+                    and candidate.coroutine is not None
+                    and (candidate.metadata or {}).get(_MCP_ORIGINAL_TOOL_NAME_KEY)
+                    == original
+                ):
+                    return await candidate.coroutine(**arguments)
+            msg = infos[0].error or f"MCP tool {original!r} is no longer available"
+            raise RuntimeError(msg)
+        finally:
+            if manager is not None:
+                await manager.cleanup()
+
+    tool.coroutine = call
 
 
 async def get_mcp_tools(
@@ -2564,14 +2635,18 @@ async def resolve_and_load_mcp_tools(
     config_load_errors: list[tuple[Path, str]] = []
 
     try:
-        config_paths = discover_mcp_configs(project_context=project_context)
+        config_sources = discover_mcp_config_sources(project_context=project_context)
     except (OSError, RuntimeError) as exc:
         logger.warning("MCP config auto-discovery failed", exc_info=True)
-        config_paths = []
+        config_sources = []
         config_load_errors.append((Path("<discovery>"), str(exc)))
 
-    user_configs, project_configs = classify_discovered_configs(config_paths)
+    sources = MCPConfigSources.from_sources(config_sources)
+    user_configs = sources.user_paths
+    project_configs = sources.project_paths
+    project_roots = sources.project_roots
     configs: list[dict[str, Any]] = []
+    session_cwd_servers: set[str] = set()
 
     for path in user_configs:
         config, error = load_mcp_config_with_error(path)
@@ -2681,13 +2756,11 @@ async def resolve_and_load_mcp_tools(
         # `configs` without a trust decision (defense in depth against a future
         # validator that accepts a shape `extract_project_server_summaries`
         # currently skips).
-        project_base = _resolve_project_config_base(project_context)
         kept: dict[str, Any] = {}
         for name, server in project_config["mcpServers"].items():
             source = server_sources[name]
-            project_root = project_root_for_mcp_config_path(
-                source, fallback=project_base
-            )
+            # Indexed, not `.get`: see `MCPConfigSources.project_roots`.
+            project_root = project_roots[source]
             kept.update(
                 filter_trusted_project_servers(
                     {name: server},
@@ -2709,6 +2782,7 @@ async def resolve_and_load_mcp_tools(
                 config_load_errors.append((server_sources[name], error))
             if valid["mcpServers"]:
                 configs.append(valid)
+                session_cwd_servers.update(valid["mcpServers"])
         elif not project_servers:
             # Nothing was trusted and no dict server produced a summary, so
             # every entry is malformed. Re-validate the merged config (no second
@@ -2736,7 +2810,9 @@ async def resolve_and_load_mcp_tools(
             if project_context is not None
             else explicit_config_path
         )
-        configs.append(load_mcp_config(config_path))
+        explicit_config = load_mcp_config(config_path)
+        configs.append(explicit_config)
+        session_cwd_servers.update(explicit_config["mcpServers"])
 
     def _bad_config_infos() -> list[MCPServerInfo]:
         return [
@@ -2756,9 +2832,19 @@ async def resolve_and_load_mcp_tools(
     if not merged.get("mcpServers"):
         return [], None, _bad_config_infos()
 
+    from deepagents_code.configuration.service import ManagedConfigError
     from deepagents_code.mcp_disabled import get_disabled_servers
 
-    disabled_names = get_disabled_servers()
+    try:
+        disabled_names = get_disabled_servers()
+    except ManagedConfigError:
+        # The managed deny list is unreadable, so no server can be shown to be
+        # permitted. Deny every one rather than start the servers an
+        # administrator may have blocked.
+        logger.error(  # noqa: TRY400
+            "Managed MCP policy is unreadable; disabling all MCP servers."
+        )
+        disabled_names = set(merged["mcpServers"])
     disabled_infos: list[MCPServerInfo] = []
     if disabled_names:
         active: dict[str, Any] = {}
@@ -2790,6 +2876,11 @@ async def resolve_and_load_mcp_tools(
 
     tools, manager, server_infos = await _load_tools_from_config(
         merged,
+        server_cwds={
+            name: str(project_context.user_cwd) for name in session_cwd_servers
+        }
+        if project_context is not None
+        else None,
         stateless=stateless,
         session_manager=session_manager,
     )

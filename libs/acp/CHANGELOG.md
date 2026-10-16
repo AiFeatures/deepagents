@@ -2,6 +2,32 @@
 
 # Changelog
 
+## [0.0.13](https://github.com/langchain-ai/deepagents/compare/deepagents-acp==0.0.12...deepagents-acp==0.0.13) (2026-10-12)
+
+### Bug Fixes
+
+- Shell permissions now apply only to the exact commands authorized.
+- Local context prompts are preserved across compaction.
+- The demo now uses valid Claude 5.5 model IDs.
+
+## [0.0.12](https://github.com/langchain-ai/deepagents/compare/deepagents-acp==0.0.11...deepagents-acp==0.0.12) (2026-09-18)
+
+### Bug Fixes
+
+- Scoped `cancel()` requests to the requested session. ([#5107](https://github.com/langchain-ai/deepagents/pull/5107))
+
+## [0.0.11](https://github.com/langchain-ai/deepagents/compare/deepagents-acp==0.0.10...deepagents-acp==0.0.11) (2026-08-27)
+
+### Features
+
+- Stream visible reasoning as thought chunks. ([#5880](https://github.com/langchain-ai/deepagents/issues/5880))
+
+## [0.0.10](https://github.com/langchain-ai/deepagents/compare/deepagents-acp==0.0.9...deepagents-acp==0.0.10) (2026-08-12)
+
+### Features
+
+- Added support for loading persistent ACP sessions ([#5365](https://github.com/langchain-ai/deepagents/issues/5365)).
+
 ## [0.0.9](https://github.com/langchain-ai/deepagents/compare/deepagents-acp==0.0.8...deepagents-acp==0.0.9) (2026-07-07)
 
 

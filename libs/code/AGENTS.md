@@ -1,6 +1,6 @@
 # `libs/code` agent guide
 
-`deepagents-code` is the interactive coding agent — the Textual REPL, headless `-x` mode, MCP integration, skills, sandbox bootstrap, and slash-command surface. Forked from `deepagents-cli` at the 0.1.0 split.
+`deepagents-code` is the interactive coding agent — the Textual REPL, headless `-x` mode, MCP integration, skills, sandbox bootstrap, and slash-command surface.
 
 For monorepo-wide conventions (commit titles, lint, testing, docs, CI, benchmarks), see the root `AGENTS.md`. For a high-level map of the package (client/server processes, request lifecycle, module map), see `ARCHITECTURE.md`.
 
@@ -30,9 +30,18 @@ IMPORTANT: `Content` requires **Textual's** `Style` (`textual.style.Style`) for 
 
 **Decision rule:** if the value could ever come from outside the codebase (user input, tool output, API responses, file contents), use `from_markup` with `$var`. If it's a hardcoded string, glyph, or computed int, `styled` is fine.
 
+### Markdown messages take a different escape path
+
+The above applies to Rich **markup**. A message mounted as markdown — `AppMessage(source, markdown=True)`, used by `/version` and `/tools` — is parsed as markdown instead, so `from_markup`/`$var` does not apply and offers no protection there. Build the source with the helpers in `app.py`:
+
+- `_escape_markdown(text)` — backslash-escapes markdown punctuation **and** collapses line breaks to spaces. Both matter: unescaped punctuation is parsed (`<b>x</b>` is swallowed as HTML, `[d](u)` collapses to its link text), and an embedded newline ends the current block, so external text could otherwise inject its own headings, lists, and tables.
+- `_markdown_table(headers, rows)` — builds a pipe table, escaping every header and cell, so a `|` cannot forge an extra column.
+
+**Decision rule:** any string reaching markdown source from outside the codebase goes through `_escape_markdown` (or `_markdown_table`, which applies it per cell). Only internal literals and computed ints may be interpolated raw.
+
 ### `App.notify()` defaults to `markup=True`
 
-Textual's `App.notify(message)` parses the message string as Rich markup by default. Any dynamic content (exception messages, file paths, user input, command strings) containing brackets `[]`, ANSI escape codes, or `=` will cause a `MarkupError` crash in Textual's Toast renderer. Always pass `markup=False` when the message contains f-string interpolated variables. Hardcoded string literals are safe with the default.
+Textual's `App.notify(message)` parses the message string as Rich markup by default. Any dynamic content (exception messages, file paths, user input, command strings) containing square brackets is unsafe: tag-shaped text like `[bold]` is silently swallowed, and closing-tag-shaped text like `[/tmp/x]` raises a `MarkupError` crash in Textual's Toast renderer. Always pass `markup=False` when the message contains f-string interpolated variables. Hardcoded string literals are safe with the default.
 
 ### Rich `console.print()` and number highlighting
 
@@ -51,6 +60,10 @@ Charset-dependent characters and animations have **single sources of truth**. Re
 - **Message passing** for widget communication - see [Events guide](https://textual.textualize.io/guide/events/)
 - **Reactive attributes** for state management - see [Reactivity guide](https://textual.textualize.io/guide/reactivity/)
 
+### Shared notification sources
+
+When a lifecycle condition needs both a TUI notification and a hook, detect it once and fan out to both from the same source. Share timing, deduplication, and message data rather than adding separate timers or parallel condition checks. Built-in UI notifications must work without configured hooks and must not wait for hook execution or depend on its success. Prefer a small shared dispatch path over introducing an event bus solely for this purpose.
+
 ### UI component organization
 
 Apply these rules to new UI; do not treat them as a mandate to refactor existing code.
@@ -67,10 +80,12 @@ Apply these rules to new UI; do not treat them as a mandate to refactor existing
 ### Testing Textual apps
 
 - Use `textual.pilot` for async UI testing - see [Testing guide](https://textual.textualize.io/guide/testing/)
-- Snapshot testing available for visual regression - see repo `notes/snapshot_testing.md`
+- Snapshot testing available for visual regression
 - For modal flows, test the real interaction path with keypresses when possible. Unit tests that call action methods or resume handlers directly can miss focus and modal-stack bugs.
+- A modal test that pushes the screen onto a bare `App` host cannot catch app-level key interception. The app owns a priority `shift+tab -> toggle_auto_approve` binding (`app.py`) that wins dispatch over any screen binding; `action_toggle_auto_approve` routes the key to the active screen. Cursor-style modals (highlighted rows, no focusable children) just implement `action_move_up` — the router's `_SupportsReverseNav` protocol branch picks them up automatically. The protocol matches on method *presence*, so enrollment is opt-out, not opt-in: a screen that defines `action_move_up` for its own arrow keys gets `shift+tab` reverse-nav whether or not it was written with that key in mind. Screens needing different behavior (`focus_previous`, tab bars) — or none — need an explicit branch *above* the protocol check in `action_toggle_auto_approve`. Add an app-level regression test in `test_app.py` when a screen needs behavior other than swallowing the key.
 - Do not open another modal or refocus the base chat input directly inside a modal dismiss callback. Preserve the non-blocking `push_screen(..., callback)` flow and schedule follow-up UI work with `call_after_refresh` so the dismissing modal fully unwinds first.
-- Be cautious replacing `push_screen(..., callback)` with an awaited modal result inside slash-command handlers; awaiting can block the Textual message pump and break keyboard navigation in the active modal.
+- Be cautious replacing `push_screen(..., callback)` with an awaited modal result inside slash-command handlers; awaiting can block the Textual message pump and break keyboard navigation in the active modal. Slash commands are dispatched from `on_chat_input_submitted`, which is awaited inline on that pump, so a modal awaited anywhere in the call chain never receives the keys that would resolve it and looks frozen.
+- When a command genuinely needs an awaited modal result, hand the continuation to `_schedule_off_message_pump` so the handler returns first. A detached continuation runs outside the handler's `try/except` and is cancelled at app exit, so it must catch its own exceptions and mount its own failure message — otherwise the failure reaches only `_log_task_exception` and the user sees no outcome at all — and it must tolerate cancellation part-way through, including mid-subprocess. Anything that mutates the running tool environment must also take `_environment_mutation_lock`, since the handler no longer serializes commands by blocking.
 
 ### Typing and test doubles
 
@@ -115,16 +130,22 @@ Debug logging is configured **once**, on the `deepagents_code` package logger, b
 
 - Do **not** add per-module `configure_debug_logging(logger)` calls. They are redundant now that the package logger is configured at import, and they reintroduce the duplicate-handler problem the single-config approach solves.
 - Every module should create its logger with `logging.getLogger(__name__)` so it stays inside the `deepagents_code.*` hierarchy and inherits the package handler. Don't set `logger.propagate = False` or attach your own handlers.
-- The **file** handler only attaches when `DEEPAGENTS_CODE_DEBUG` is truthy; that path is a single env-var read, so it's safe on the startup hot path. See `DEVELOPMENT.md` for the `DEEPAGENTS_CODE_DEBUG` / `DEEPAGENTS_CODE_DEBUG_FILE` / `DEEPAGENTS_CODE_LOG_LEVEL` env vars.
+- The **file** handler only attaches when `DEEPAGENTS_CODE_DEBUG` is truthy and the active thread is known; that path is a small env-var read and filesystem operation, so it's safe on the startup hot path. See `DEVELOPMENT.md` for the `DEEPAGENTS_CODE_DEBUG` / `DEEPAGENTS_CODE_DEBUG_DIRECTORY` / `DEEPAGENTS_CODE_LOG_LEVEL` env vars.
 - Separately, an **always-on in-memory ring buffer** (`_debug_buffer.install_log_buffer`, called from `__init__.py` right before `configure_debug_logging`) attaches unconditionally at import so the in-app Debug Console (`Ctrl+\`) can tail recent `deepagents_code.*` records without file logging. It captures `INFO` and above by default (or `DEEPAGENTS_CODE_LOG_LEVEL`), and may lower the package logger to `INFO` for the process lifetime. It never spills to the terminal (a handler is always found, so `lastResort` is skipped) and is bounded (a `deque` of 1000 records *per log level*), so it's cheap enough to keep on. Because it installs *before* `configure_debug_logging`, warnings that helper emits at startup are captured and visible in the console.
 
 ## CLI help screen
 
 The `deepagents-code --help` screen is hand-maintained in `ui.show_help()`, separate from the argparse definitions in `main.parse_args()`. When adding a new CLI flag, update **both** files. A drift-detection test (`test_args.TestHelpScreenDrift`) fails if a flag is registered in argparse but missing from the help screen.
 
+## Command name in hints
+
+Hints that tell the user to run something (for example the teardown `-r <thread>` resume hint) must render `_invocation.invoked_name()` rather than a literal `dcode`. The package ships two console scripts (`dcode` and `deepagents-code`), and per-checkout shims — a renamed symlink pointing at a worktree's `bin/dcode` — are a common way to run several installs side by side, so a hardcoded name sends those users to a command they do not have. `invoked_name()` resolves from `sys.argv[0]` (an internal env sentinel carries it across the auto-update re-exec, which drops argv[0]) and falls back to `dcode` when the launch name is not a plausible command. The hand-maintained `--help` usage lines still hardcode `dcode`.
+
 ## Splash screen tips
 
-When adding a user-facing CLI feature (new slash command, keybinding, workflow), add a corresponding entry to the `_TIPS` dict in `deepagents_code/tui/widgets/startup_tip.py`, mapping the tip text to a relative selection weight (higher = shown more often). One tip is chosen at random above the input on startup to help users discover features. Keep tips short and action-oriented (e.g., `"Press ctrl+x to compose prompts in your external editor"`).
+Treat the `_TIPS` dict in `deepagents_code/tui/widgets/startup_tip.py` as a curated, limited-attention surface, not a feature changelog. Do not add a tip by default when adding a feature. One tip is chosen at random above the chat input on startup, so each addition competes with existing tips.
+
+Add a tip only for a broadly useful, frequently applicable action that is hard to discover through existing help or UI and can be explained accurately in one short, action-oriented sentence (e.g., `"Press ctrl+g to compose prompts in your external editor"`). Niche or advanced configuration, experimental or opt-in tuning, and features requiring caveats about cost, quality, or tradeoffs belong in documentation or contextual help, not startup tips. If the value to most users is unclear, leave the list unchanged. Before adding one, check for overlap and explain why it earns space over existing tips in the PR. Map accepted tip text to a relative selection weight (higher = shown more often); do not increase weight merely because a feature is new.
 
 ## Slash commands
 
@@ -138,8 +159,8 @@ To add a new slash command: (1) add a `SlashCommand` entry to `COMMANDS`, (2) se
 
 1. `deepagents_code/model_config.py` — add `"provider_name": "ENV_VAR_NAME"` to `PROVIDER_API_KEY_ENV`
 2. `deepagents_code/model_config.py` — if the provider reads a *dedicated* endpoint env var, add `"provider_name": ("CANONICAL_BASE_URL", "ALTERNATE", ...)` to `PROVIDER_BASE_URL_ENV` (see guidelines below); omit the provider entirely when it has no provider-specific endpoint variable
-3. `pyproject.toml` — add `provider = ["langchain-provider>=X.Y.Z,<N.0.0"]` to `[project.optional-dependencies]` and include it in the `all-providers` composite extra
-4. `deepagents_code/model_config.py` — add `"provider_name"` to `RETRY_PARAM_BY_PROVIDER` if the provider's chat model accepts `max_retries`
+3. `deepagents_code/model_config.py` — add `"provider_name": "max_retries"` (or the provider's actual retry-count constructor kwarg) to `RETRY_PARAM_BY_PROVIDER`. dcode's model-node middleware owns the retry budget, so this entry is the disable-list that forces the provider's own SDK retry loop off; omitting it lets the SDK retries multiply the middleware's attempts. Verify the kwarg name against the integration's constructor — leave the provider out only when it exposes no integer retry-count kwarg. Check what the kwarg counts: retries are disabled with the default zero, but a kwarg counting *total attempts* needs an entry in `RETRY_DISABLE_VALUE_BY_PROVIDER` (see `google_genai`), because zero attempts either restores the SDK default or is coerced back to one
+4. `pyproject.toml` — add `provider = ["langchain-provider>=X.Y.Z,<N.0.0"]` to `[project.optional-dependencies]` and include it in the `all-providers` composite extra
 5. `deepagents_code/tui/widgets/auth.py` — add `"provider_name": "Display Name"` to `PROVIDER_DISPLAY_NAMES` so the `/auth` UI shows a branded label instead of the title-cased key, and (if the provider issues API keys from a self-serve page) `"provider_name": "https://…"` to `PROVIDER_API_KEY_URLS` so the prompt links straight to the key page
 6. `tests/unit_tests/test_model_config.py` — add `assert PROVIDER_API_KEY_ENV["provider_name"] == "ENV_VAR_NAME"` to `TestProviderApiKeyEnv.test_contains_major_providers`, and pin any `PROVIDER_BASE_URL_ENV` entry with a matching assertion
 
@@ -155,6 +176,6 @@ To add a new slash command: (1) add a `SlashCommand` entry to `COMMANDS`, (2) se
 **Not required** unless the provider's models have a distinctive name prefix (like `gpt-*`, `claude*`, `gemini*`):
 
 - `detect_provider()` in `config.py` — only needed for auto-detection from bare model names
-- `Settings.has_*` property in `config.py` — only needed if referenced by `detect_provider()` fallback logic
+- `Credentials.has_*` property in `config.py` — only needed if referenced by `detect_provider()` fallback logic
 
 Model discovery, credential checking, and UI integration are automatic once `PROVIDER_API_KEY_ENV` is populated and the `langchain-*` package is installed.

@@ -1,9 +1,11 @@
 r"""Read-only in-app Debug Console modal.
 
 Toggled with `Ctrl+\` (or the hidden `/debug` command), this overlay shows a
-point-in-time session/runtime snapshot plus a live tail of recent
+live session/runtime snapshot plus a live tail of recent
 `deepagents_code.*` log records sourced from the in-memory ring buffer in
-`_debug_buffer`. It never mutates session state.
+`_debug_buffer`. The snapshot is seeded at open and, when the host supplies a
+`snapshot_provider`, rebuilt on the same refresh tick as the log tail. It never
+mutates session state.
 """
 
 from __future__ import annotations
@@ -24,7 +26,7 @@ from textual.screen import ModalScreen
 from textual.scroll_view import ScrollView
 from textual.strip import Strip
 from textual.style import Style as TStyle
-from textual.widgets import Checkbox, Select, Static
+from textual.widgets import Button, Checkbox, Select, Static
 from textual.widgets._select import (  # noqa: PLC2701  # needed to keep Tab navigation inside the open Select overlay
     SelectCurrent,
     SelectOverlay,
@@ -39,6 +41,8 @@ from deepagents_code._debug_buffer import (
     retention_bucket_for_level,
 )
 from deepagents_code.clipboard import copy_text_to_clipboard
+from deepagents_code.config import get_glyphs
+from deepagents_code.tui.widgets._copy_spans import copy_span_style, copy_span_target
 from deepagents_code.tui.widgets._links import open_style_link
 from deepagents_code.unicode_security import sanitize_control_chars
 
@@ -47,6 +51,8 @@ if TYPE_CHECKING:
 
     from textual import events
     from textual.app import ComposeResult
+
+    from deepagents_code.mcp_tools import MCPServerInfo
 
 logger = logging.getLogger(__name__)
 
@@ -59,7 +65,8 @@ class SnapshotField(NamedTuple):
 
     The four named fields keep the display strings and their interaction metadata
     explicit at construction sites. `copyable` opts a row into click-to-copy, and
-    `thread_id` enables a resolvable `(langsmith)` trace link for the thread row.
+    `thread_id` enables a resolvable `(open in langsmith)` trace link for the
+    thread row.
     """
 
     label: str
@@ -67,15 +74,8 @@ class SnapshotField(NamedTuple):
     copyable: bool = False
     """Whether `value` can be clicked to copy it to the clipboard."""
     thread_id: str | None = None
-    """A LangSmith thread id whose ``(langsmith)`` trace link is appended to the
-    row once the URL resolves. `None` disables the link."""
-
-
-_SNAPSHOT_COPY_META = "snapshot_copy"
-"""Meta key marking a snapshot span whose text is copied on click."""
-
-_SNAPSHOT_COPY_LABEL_META = "snapshot_copy_label"
-"""Meta key carrying the snapshot field label used in the copy toast."""
+    """A LangSmith thread id whose ``(open in langsmith)`` trace link is appended
+    to the row once the URL resolves. `None` disables the link."""
 
 
 _REFRESH_INTERVAL = 0.5
@@ -90,9 +90,16 @@ level-partitioned retention instead of re-flattening it into a single window."""
 _FILTER_SELECT_ID = "debug-level-filter"
 _CLICK_TO_COPY_ID = "debug-click-to-copy"
 """Id of the checkbox that opts click-to-copy in for the console."""
+_COST_BREAKDOWN_ID = "debug-cost-breakdown"
+_MCP_SERVERS_ID = "debug-mcp-servers"
 _CLICK_TO_COPY_DEFAULT = False
 """Whether click-to-copy is enabled before the user toggles the checkbox."""
-_FOCUS_CYCLE = f"#{_FILTER_SELECT_ID}, #{_CLICK_TO_COPY_ID}, #debug-log"
+_MIN_HANGING_VALUE_WIDTH = 10
+"""Minimum readable value-column width for hanging snapshot rows."""
+_FOCUS_CYCLE = (
+    f"#{_COST_BREAKDOWN_ID}, #{_MCP_SERVERS_ID}, "
+    f"#{_FILTER_SELECT_ID}, #{_CLICK_TO_COPY_ID}, #debug-log"
+)
 """Tab-cycle selector spanning the toolbar controls and the log view."""
 FilterValue = Literal[
     "all",
@@ -153,9 +160,15 @@ def _filter_options() -> tuple[tuple[str, FilterValue], ...]:
     """Return level filter options valid for the current logging configuration."""
     if not _debug_records_enabled():
         return _BASE_FILTER_OPTIONS
-    all_option = _BASE_FILTER_OPTIONS[:1]
-    rest = _BASE_FILTER_OPTIONS[1:]
-    return (*all_option, *_DEBUG_FILTER_OPTIONS, *rest)
+    minimum_options = _BASE_FILTER_OPTIONS[:5]
+    only_options = _BASE_FILTER_OPTIONS[5:]
+    return (
+        minimum_options[0],
+        _DEBUG_FILTER_OPTIONS[0],
+        *minimum_options[1:],
+        _DEBUG_FILTER_OPTIONS[1],
+        *only_options,
+    )
 
 
 def _record_matches_filter(
@@ -267,6 +280,7 @@ class _DebugLogView(ScrollView, can_focus=True):
         self._wrap_prefix: list[int] = [0]
         self._total_visual = 0
         self._cached_width = 0
+        self._scroll_end_after_layout = False
         self._hover_index: int | None = None
         self._selected_index: int | None = None
         self._render_line_cache: LRUCache[
@@ -307,8 +321,9 @@ class _DebugLogView(ScrollView, can_focus=True):
         start = len(self._contents)
         self._records.extend(records)
         self._contents.extend(_record_to_content(record) for record in records)
-        width = self._cached_width or self.size.width
+        width = self._cached_width or self.scrollable_content_region.width
         if width <= 0:
+            self._scroll_end_after_layout = self._scroll_end_after_layout or at_bottom
             # Not yet sized (e.g. first poll before layout). Assume one visual
             # line per new content so `_wrap_counts` stays 1:1 with `_contents`;
             # the first `on_resize` reflow recomputes real counts. Skipping this
@@ -341,7 +356,7 @@ class _DebugLogView(ScrollView, can_focus=True):
         self._hover_index = None
         self._selected_index = None
         self._render_line_cache.clear()
-        self.virtual_size = Size(self.size.width, 0)
+        self.virtual_size = Size(self.scrollable_content_region.width, 0)
         self.refresh()
 
     def show_notice(self, message: str) -> None:
@@ -372,7 +387,7 @@ class _DebugLogView(ScrollView, can_focus=True):
         self._total_visual = self._wrap_prefix[-1]
 
     def _reflow(self) -> None:
-        width = self.size.width
+        width = self.scrollable_content_region.width
         if width <= 0:
             width = self._cached_width
         if width <= 0:
@@ -444,7 +459,7 @@ class _DebugLogView(ScrollView, can_focus=True):
     def render_line(self, y: int) -> Strip:
         _scroll_x, scroll_y = self.scroll_offset
         abs_y = scroll_y + y
-        width = self.size.width
+        width = self.scrollable_content_region.width
         key = (
             abs_y,
             width,
@@ -496,10 +511,13 @@ class _DebugLogView(ScrollView, can_focus=True):
         super().notify_style_update()
         self._render_line_cache.clear()
 
-    def on_resize(self, event: events.Resize) -> None:
+    def on_resize(self, _event: events.Resize) -> None:
         """Re-wrap log entries when the view width changes."""
-        if event.size.width != self._cached_width:
+        if self.scrollable_content_region.width != self._cached_width:
             self._reflow()
+        if self._scroll_end_after_layout:
+            self._scroll_end_after_layout = False
+            self.scroll_end(animate=False, immediate=True, x_axis=False)
 
     def on_mouse_move(self, event: events.MouseMove) -> None:
         """Highlight the logical log record under the pointer."""
@@ -580,27 +598,6 @@ class _DebugLogView(ScrollView, can_focus=True):
             self._on_copy_record(record)
 
 
-def _snapshot_copy_target(style: object) -> tuple[str, str] | None:
-    """Return the copy text and field label from a snapshot span style, if any.
-
-    Args:
-        style: The Textual event style under the pointer/click.
-
-    Returns:
-        `(text, label)` when the span carries a copy marker, else `None`.
-    """
-    meta = getattr(style, "meta", None)
-    if not isinstance(meta, dict):
-        return None
-    text = meta.get(_SNAPSHOT_COPY_META)
-    if not isinstance(text, str) or not text:
-        return None
-    label = meta.get(_SNAPSHOT_COPY_LABEL_META)
-    if not isinstance(label, str) or not label:
-        return None
-    return text, label
-
-
 def _snapshot_copy_success_message(label: str) -> str:
     """Build the toast shown after copying a snapshot field value.
 
@@ -618,7 +615,7 @@ def _snapshot_copy_success_message(label: str) -> str:
 
 
 class _SnapshotView(Static):
-    """Snapshot header that copies marked spans and opens link spans on click."""
+    """Snapshot header that copies marked spans and hangs wrapped values."""
 
     # Match WelcomeBanner: disabling auto_links avoids a hover-refresh flicker
     # loop caused by link styles getting a fresh random id on every render.
@@ -638,6 +635,61 @@ class _SnapshotView(Static):
         """
         super().__init__(classes=classes)
         self._on_copy = on_copy
+        self._snapshot_content = Content()
+        self._continuation_indent = 0
+
+    def update_snapshot(self, content: Content, continuation_indent: int) -> None:
+        """Update the snapshot and its shared value-column offset."""
+        self._snapshot_content = content
+        self._continuation_indent = continuation_indent
+        self.update(content)
+
+    def render(self) -> Content:
+        """Render values with continuation lines aligned to the value column.
+
+        Returns:
+            The snapshot content wrapped to the current width.
+        """
+        return self._wrapped_content(self.content_size.width)
+
+    def get_content_height(self, container: Size, viewport: Size, width: int) -> int:
+        """Measure the hanging-wrapped snapshot at its available width.
+
+        Returns:
+            The number of rendered snapshot lines.
+        """
+        del container, viewport
+        if width <= 0:
+            return 0
+        return len(self._wrapped_content(width).split(allow_blank=True))
+
+    def _wrapped_content(self, width: int) -> Content:
+        """Wrap each row while preserving its label as a hanging indent.
+
+        Rows hang continuation lines under the value column only when that
+        leaves a readable value width; on narrower terminals the whole row
+        wraps flat instead, so values stay readable without making the fixed
+        header excessively tall.
+
+        Returns:
+            Snapshot content with wrapped value lines indented.
+        """
+        indent = self._continuation_indent
+        if width <= 0:
+            return self._snapshot_content
+        value_width = width - indent
+        flat = value_width < _MIN_HANGING_VALUE_WIDTH or indent <= 0
+        wrapped: list[Content] = []
+        padding = Content(" " * indent)
+        for row in self._snapshot_content.split(allow_blank=True):
+            if flat:
+                wrapped.extend(row.wrap(width))
+                continue
+            prefix, value = row.divide([indent])
+            value_lines = value.wrap(value_width)
+            wrapped.append(Content.assemble(prefix, value_lines[0]))
+            wrapped.extend(Content.assemble(padding, line) for line in value_lines[1:])
+        return Content("\n").join(wrapped)
 
     def on_click(self, event: events.Click) -> None:
         """Copy a marked span or open a link span under the click.
@@ -649,7 +701,7 @@ class _SnapshotView(Static):
         if getattr(event.style, "link", None):
             open_style_link(event)
             return
-        target = _snapshot_copy_target(event.style)
+        target = copy_span_target(event.style)
         if target is not None:
             event.stop()
             text, label = target
@@ -658,7 +710,7 @@ class _SnapshotView(Static):
     def on_mouse_move(self, event: events.MouseMove) -> None:
         """Show a hand pointer over clickable spans and reset it elsewhere."""
         clickable = bool(getattr(event.style, "link", None)) or (
-            _snapshot_copy_target(event.style) is not None
+            copy_span_target(event.style) is not None
         )
         self.styles.pointer = "pointer" if clickable else "default"
 
@@ -673,13 +725,13 @@ class DebugConsoleScreen(ModalScreen[None]):
     BINDINGS: ClassVar[list[BindingType]] = [
         Binding("escape", "close", "Close", show=False),
         Binding(DEBUG_TOGGLE_KEY, "close", "Close", show=False, priority=True),
-        Binding("ctrl+l", "clear_view", "Clear view", show=False, priority=True),
+        Binding("ctrl+x,ctrl+l", "clear_view", "Clear view", show=False, priority=True),
         # Not `priority`: a priority `c` would pre-empt type-to-search in the
         # open level dropdown (e.g. typing "c" to reach CRITICAL). The log view
         # has no `c` binding, so it still bubbles up to this copy action.
         Binding("c", "copy", "Copy", show=False),
     ]
-    """The toggle-key close (`ctrl+backslash`) and `ctrl+l` clear-view are
+    """The toggle-key close (`ctrl+backslash`) and clear-view shortcuts are
     `priority`. Escape close and `c` copy are deliberately *not* `priority`:
     Escape must reach the open level dropdown's overlay first so it closes only
     the menu (a priority Escape would tear down the whole console instead), and
@@ -708,6 +760,24 @@ class DebugConsoleScreen(ModalScreen[None]):
 
     DebugConsoleScreen .debug-console-snapshot {
         margin-bottom: 1;
+    }
+
+    DebugConsoleScreen .debug-console-details {
+        width: auto;
+        min-width: 0;
+        height: 1;
+        border: none;
+        padding: 0 1;
+        margin-bottom: 1;
+        color: $primary;
+        background: transparent;
+    }
+
+    DebugConsoleScreen .debug-console-details:hover,
+    DebugConsoleScreen .debug-console-details:focus {
+        color: $text;
+        background: $surface-lighten-1;
+        text-style: bold;
     }
 
     DebugConsoleScreen .debug-console-toolbar {
@@ -758,6 +828,9 @@ class DebugConsoleScreen(ModalScreen[None]):
         self,
         snapshot: Sequence[SnapshotField],
         *,
+        snapshot_provider: Callable[[], Sequence[SnapshotField]] | None = None,
+        cost_breakdown_provider: Callable[[], str] | None = None,
+        mcp_servers_provider: Callable[[], Sequence[MCPServerInfo]] | None = None,
         cleared_upto: int = 0,
         on_clear: Callable[[int], None] | None = None,
         click_to_copy: bool = _CLICK_TO_COPY_DEFAULT,
@@ -766,11 +839,19 @@ class DebugConsoleScreen(ModalScreen[None]):
         """Initialize with a captured *snapshot* of session/runtime fields.
 
         Args:
-            snapshot: Ordered `SnapshotField` rows rendered in the header.
-            cleared_upto: Absolute emission index a prior `Ctrl+L` cleared up to.
+            snapshot: Ordered `SnapshotField` rows rendered on first paint.
+            snapshot_provider: Optional callable that rebuilds the snapshot from
+                live host state. When set, the header is refreshed on the same
+                tick as the log tail whenever the provider returns a different
+                row list. Omit for a freeze-frame header (e.g. unit tests).
+            cost_breakdown_provider: Optional callable that builds the detailed
+                token and cost breakdown shown in a dedicated modal. An empty
+                string hides the breakdown button.
+            mcp_servers_provider: Live metadata for the read-only MCP server modal.
+            cleared_upto: Absolute emission index a prior clear advanced to.
                 The console starts rendering from here so a clear persists across
                 close/reopen; records emitted after it still appear.
-            on_clear: Invoked with the new clear cursor whenever `Ctrl+L` clears
+            on_clear: Invoked with the new clear cursor whenever a shortcut clears
                 the view, letting the owner persist it for the next open.
             click_to_copy: Initial state of the "Click to copy" checkbox,
                 restored from the persisted preference.
@@ -779,9 +860,12 @@ class DebugConsoleScreen(ModalScreen[None]):
         """
         super().__init__()
         self._snapshot = list(snapshot)
+        self._snapshot_provider = snapshot_provider
+        self._cost_breakdown_provider = cost_breakdown_provider
+        self._mcp_servers_provider = mcp_servers_provider
         self._records: list[InMemoryLogRecord] = []
         # Absolute index of the next unrendered log record (incremental writes),
-        # seeded from any persisted clear so reopening honors the last Ctrl+L.
+        # seeded from any persisted clear so reopening honors the last reset.
         self._rendered_upto = cleared_upto
         self._on_clear = on_clear
         # One-shot guard so the "buffer unavailable" notice is written only once.
@@ -792,6 +876,12 @@ class DebugConsoleScreen(ModalScreen[None]):
         # Seed links resolved elsewhere in this process (normally the welcome
         # banner) so reopening the console does not briefly render without one.
         self._langsmith_urls = self._cached_langsmith_urls()
+        # Thread ids a lookup worker has already been scheduled for, so the
+        # refresh tick never stacks overlapping lookups for the same thread.
+        self._langsmith_attempted: set[str] = set()
+        # Whether the last provider poll raised, so a persistent failure logs a
+        # single WARNING instead of one per refresh tick.
+        self._snapshot_poll_failing = False
 
     def _cached_langsmith_urls(self) -> dict[str, str]:
         """Return immediately available LangSmith URLs for snapshot threads."""
@@ -825,8 +915,24 @@ class DebugConsoleScreen(ModalScreen[None]):
                 self._copy_snapshot_value,
                 classes="debug-console-snapshot",
             )
-            snapshot_view.update(self._render_snapshot())
+            snapshot_view.update_snapshot(
+                self._render_snapshot(), self._snapshot_value_column()
+            )
             yield snapshot_view
+            if self._cost_breakdown_provider is not None:
+                yield Button(
+                    "View token & cost breakdown",
+                    id=_COST_BREAKDOWN_ID,
+                    classes="debug-console-details",
+                    variant="default",
+                )
+            if self._mcp_servers_provider is not None:
+                yield Button(
+                    "View MCP servers",
+                    id=_MCP_SERVERS_ID,
+                    classes="debug-console-details",
+                    variant="default",
+                )
             with Horizontal(classes="debug-console-toolbar"):
                 yield Static("Level", classes="debug-console-filter-label")
                 yield _LogLevelSelect(
@@ -853,19 +959,87 @@ class DebugConsoleScreen(ModalScreen[None]):
 
     def on_mount(self) -> None:
         """Start the refresh timer and render the current buffer contents."""
-        self.set_interval(_REFRESH_INTERVAL, self._poll_logs)
-        self._poll_logs()
+        self.set_interval(_REFRESH_INTERVAL, self._on_refresh_tick)
+        self._on_refresh_tick()
         self._resolve_langsmith_links()
         self.call_after_refresh(self.query_one("#debug-log", _DebugLogView).focus)
 
+    def _on_refresh_tick(self) -> None:
+        """Rebuild the snapshot header (when live) and append new log records."""
+        self._poll_snapshot()
+        self._refresh_cost_breakdown_button()
+        self._poll_logs()
+
+    def _refresh_cost_breakdown_button(self) -> None:
+        """Show cost detail only when the provider has historical coverage."""
+        if self._cost_breakdown_provider is None:
+            return
+        try:
+            available = bool(self._cost_breakdown_provider())
+        except Exception:
+            logger.debug("Cost breakdown build failed", exc_info=True)
+            available = False
+        self.query_one(f"#{_COST_BREAKDOWN_ID}", Button).display = available
+
+    def _poll_snapshot(self) -> None:
+        """Rebuild the snapshot header from the host provider, if configured.
+
+        Reuses the log-tail timer so the header tracks live session state (message
+        counts, tokens, thread id, …) without a second schedule. Failures are
+        swallowed with a WARNING so a misbehaving provider cannot tear down the
+        diagnostic overlay or its log tail. Only the transition into failure logs
+        at WARNING: a provider that keeps raising would otherwise emit a
+        traceback every tick into the very ring buffer the console is tailing,
+        flooding out the records the user opened it to read. Repeats stay at
+        DEBUG, and a later success re-arms the WARNING.
+        """
+        if self._snapshot_provider is None:
+            return
+        try:
+            self._poll_snapshot_once()
+        except Exception:  # a diagnostic must never crash the app it inspects
+            if self._snapshot_poll_failing:
+                logger.debug("Debug console snapshot poll failed again", exc_info=True)
+            else:
+                self._snapshot_poll_failing = True
+                logger.warning("Debug console snapshot poll failed", exc_info=True)
+        else:
+            self._snapshot_poll_failing = False
+
+    def _poll_snapshot_once(self) -> None:
+        """Refresh `self._snapshot` from the provider when its rows changed."""
+        if self._snapshot_provider is None:
+            return
+        next_snapshot = list(self._snapshot_provider())
+        if next_snapshot == self._snapshot:
+            return
+        self._snapshot = next_snapshot
+        self._refresh_snapshot()
+        # A thread switch mid-open needs a fresh LangSmith resolve for any new
+        # ids; unchanged ids keep their cached URLs and are skipped inside.
+        self._resolve_langsmith_links()
+
     def _resolve_langsmith_links(self) -> None:
-        """Kick off background resolution of `(langsmith)` links for the snapshot."""
+        """Kick off background resolution of `(open in langsmith)` snapshot links.
+
+        Each thread id gets at most one lookup per console open. The refresh tick
+        calls this on every snapshot change, and a resolved URL is only recorded
+        on success, so without a separate guard a slow or failing lookup would be
+        restarted every 500 ms. `asyncio.wait_for` cannot cancel the blocking SDK
+        call inside `asyncio.to_thread`, so those retries would pile up executor
+        threads and network requests for as long as the console stays open.
+        Attempted ids therefore stay marked even after the worker finishes;
+        reopening the console retries with a fresh screen.
+        """
         thread_ids = {
             field.thread_id
             for field in self._snapshot
-            if field.thread_id and field.thread_id not in self._langsmith_urls
+            if field.thread_id
+            and field.thread_id not in self._langsmith_urls
+            and field.thread_id not in self._langsmith_attempted
         }
         for thread_id in thread_ids:
+            self._langsmith_attempted.add(thread_id)
             self.run_worker(
                 self._fetch_langsmith_link(thread_id),
                 exclusive=False,
@@ -917,8 +1091,8 @@ class DebugConsoleScreen(ModalScreen[None]):
         from textual.css.query import NoMatches
 
         try:
-            self.query_one(".debug-console-snapshot", _SnapshotView).update(
-                self._render_snapshot()
+            self.query_one(".debug-console-snapshot", _SnapshotView).update_snapshot(
+                self._render_snapshot(), self._snapshot_value_column()
             )
         except NoMatches:
             # The console was dismissed before the worker returned.
@@ -972,6 +1146,38 @@ class DebugConsoleScreen(ModalScreen[None]):
         overlay = select.query_one(SelectOverlay)
         return overlay.display and overlay.region.contains(offset.x, offset.y)
 
+    def on_button_pressed(self, event: Button.Pressed) -> None:
+        """Open read-only session details."""
+        if event.button.id == _MCP_SERVERS_ID:
+            event.stop()
+            if self._mcp_servers_provider is not None:
+                from deepagents_code.tui.modals.mcp_servers import MCPServersScreen
+
+                self.app.push_screen(MCPServersScreen(self._mcp_servers_provider))
+            return
+        if event.button.id != _COST_BREAKDOWN_ID:
+            return
+        event.stop()
+        if self._cost_breakdown_provider is None:
+            return
+        from deepagents_code.tui.modals.cost_breakdown import CostBreakdownScreen
+
+        try:
+            breakdown = self._cost_breakdown_provider()
+        except Exception:
+            logger.warning("Cost breakdown build failed", exc_info=True)
+            self.app.notify(
+                "Token and cost breakdown unavailable",
+                severity="warning",
+                timeout=3,
+                markup=False,
+            )
+            return
+        if breakdown:
+            self.app.push_screen(
+                CostBreakdownScreen(breakdown, self._cost_breakdown_provider)
+            )
+
     def on_select_changed(self, event: Select.Changed) -> None:
         """Refresh visible records when the log-level filter changes."""
         if event.select.id != _FILTER_SELECT_ID:
@@ -1001,6 +1207,12 @@ class DebugConsoleScreen(ModalScreen[None]):
         if self._on_click_to_copy_change is not None:
             self._on_click_to_copy_change(event.value)
 
+    def _snapshot_value_column(self) -> int:
+        """Return the cell offset shared by snapshot field values."""
+        if not self._snapshot:
+            return 0
+        return max(len(field.label) for field in self._snapshot) + 2
+
     def _render_snapshot(self) -> Content:
         """Build the right-aligned `label: value` snapshot block.
 
@@ -1009,7 +1221,7 @@ class DebugConsoleScreen(ModalScreen[None]):
         """
         if not self._snapshot:
             return Content.styled("(no session data)", "dim italic")
-        width = max(len(field.label) for field in self._snapshot)
+        width = self._snapshot_value_column() - 2
         lines = [self._render_snapshot_row(field, width) for field in self._snapshot]
         return Content("\n").join(lines)
 
@@ -1027,22 +1239,12 @@ class DebugConsoleScreen(ModalScreen[None]):
             (f"{field.label:>{width}}  ", "bold")
         ]
         if field.copyable and field.value:
-            parts.append(
-                (
-                    field.value,
-                    TStyle.from_meta(
-                        {
-                            _SNAPSHOT_COPY_META: field.value,
-                            _SNAPSHOT_COPY_LABEL_META: field.label,
-                        }
-                    ),
-                )
-            )
+            parts.append((field.value, copy_span_style(field.value, field.label)))
         else:
             parts.append(field.value)
         url = self._langsmith_urls.get(field.thread_id) if field.thread_id else None
         if url:
-            parts.extend(("  ", ("(langsmith)", TStyle(link=url))))
+            parts.extend(("  ", ("(open in langsmith)", TStyle(link=url))))
         return Content.assemble(*parts)
 
     @staticmethod
@@ -1053,7 +1255,9 @@ class DebugConsoleScreen(ModalScreen[None]):
             The formatted key-hint line.
         """
         return Content.styled(
-            "Esc close · Ctrl+L clear view · c copy visible logs · Enter copy line",
+            f"Esc close {get_glyphs().separator} Ctrl+X clear "
+            f"{get_glyphs().separator} c copy visible logs "
+            f"{get_glyphs().separator} Enter copy line",
             "dim italic",
         )
 

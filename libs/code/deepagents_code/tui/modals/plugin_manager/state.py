@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 import logging
 from pathlib import Path
 from typing import TYPE_CHECKING
@@ -23,6 +24,7 @@ from deepagents_code.plugins.marketplace import (
     materialize_plugin_source,
     redact_marketplace_source,
     redact_urls_in_text,
+    unresolved_source_message,
 )
 from deepagents_code.plugins.models import LocalPluginSource, split_plugin_id
 from deepagents_code.plugins.store import (
@@ -30,6 +32,7 @@ from deepagents_code.plugins.store import (
     load_enabled_plugin_ids,
     load_installed_plugins,
     load_marketplace_records,
+    plugin_mutation_lock,
 )
 from deepagents_code.tui.modals.plugin_manager.models import (
     _ManagerState,
@@ -208,6 +211,58 @@ def _preview_local_plugin_instance(
     return loaded
 
 
+@plugin_mutation_lock()
+def _inspect_plugin(row: _PluginRow) -> _PluginRow:
+    """Download and inventory one plugin without installing or executing it.
+
+    Returns:
+        A row with the inspected component names.
+
+    Raises:
+        MarketplaceError: If the source or its inventory cannot be inspected.
+    """
+    from deepagents_code.plugins.discovery import (
+        _plugin_from_install_path,
+        _resolve_marketplace_and_entry,
+    )
+
+    marketplace, entry = _resolve_marketplace_and_entry(row.plugin_id)
+    rejections: list[str] = []
+    root = materialize_plugin_source(marketplace, entry, rejections=rejections)
+    if root is None:
+        raise MarketplaceError(
+            unresolved_source_message(row.plugin_id, entry, rejections)
+        )
+    instance, warnings = _plugin_from_install_path(
+        plugin_id=row.plugin_id,
+        root=root,
+        marketplace_name=marketplace.name,
+        fallback_name=entry.name,
+    )
+    if instance is None or warnings:
+        msg = "; ".join(warnings) or "Could not inspect plugin contents."
+        raise MarketplaceError(msg)
+    for path in (*instance.inventory.mcp_files, *instance.inventory.hook_files):
+        if path.suffix in {".mcpb", ".dxt"}:
+            msg = f"Cannot inspect unsupported MCP bundle: {path.name}"
+            raise MarketplaceError(msg)
+        document = json.loads(path.read_text(encoding="utf-8"))
+        if not isinstance(document, dict):
+            msg = f"Cannot inspect {path.name}: expected a JSON object."
+            raise MarketplaceError(msg)
+    return _row_from_instance(
+        plugin_id=row.plugin_id,
+        description=row.description,
+        author=row.author,
+        is_enabled=row.enabled,
+        instance=instance,
+        mcp_server_info=(),
+        mcp_connecting=False,
+        loaded_plugin_ids=frozenset(),
+        display_name=row.display_name,
+    )
+
+
 def _row_from_instance(
     *,
     plugin_id: str,
@@ -216,13 +271,17 @@ def _row_from_instance(
     is_enabled: bool,
     instance: PluginInstance | None,
     mcp_server_info: Sequence[MCPServerInfo],
+    mcp_connecting: bool,
     loaded_plugin_ids: AbstractSet[str],
     load_error: str | None = None,
     display_name: str = "",
 ) -> _PluginRow:
+    from deepagents_code.plugins.adapters.hooks import plugin_hook_event_names
+
     skill_names = _list_plugin_skill_names(instance) if instance else ()
     mcp_names = _plugin_mcp_server_names(instance) if instance else ()
     login_servers = _plugin_mcp_login_servers(instance) if instance else ()
+    hook_events = plugin_hook_event_names(instance) if instance else ()
     unsupported = instance.inventory.unsupported if instance else ()
     session_loaded = plugin_id in loaded_plugin_ids
     return _PluginRow(
@@ -234,11 +293,16 @@ def _row_from_instance(
         display_name=display_name,
         skill_count=len(skill_names) if instance else None,
         skill_names=skill_names,
+        # Tri-state: `None` means "unknown, render nothing". While the
+        # session is still connecting, `mcp_server_info` is not yet
+        # trustworthy, so report unknown rather than a false "not connected"
+        # that would show a bogus "run /reload to connect" hint.
         mcp_connected=_plugin_mcp_connected(instance, mcp_server_info)
-        if instance and session_loaded
+        if instance and session_loaded and not mcp_connecting
         else None,
         mcp_server_names=mcp_names,
         mcp_login_servers=login_servers,
+        hook_events=hook_events,
         unsupported_components=unsupported,
         session_loaded=session_loaded,
         load_error=load_error,
@@ -248,6 +312,7 @@ def _row_from_instance(
 def _load_manager_state(
     mcp_server_info: Sequence[MCPServerInfo] = (),
     *,
+    mcp_connecting: bool = False,
     loaded_plugin_ids: AbstractSet[str] = frozenset(),
 ) -> _ManagerState:
     records = load_marketplace_records()
@@ -325,6 +390,7 @@ def _load_manager_state(
                 is_enabled=is_enabled,
                 instance=instance,
                 mcp_server_info=mcp_server_info,
+                mcp_connecting=mcp_connecting,
                 loaded_plugin_ids=loaded_plugin_ids,
                 load_error=load_error,
                 display_name=_plugin_display_name(

@@ -124,7 +124,7 @@ def list_skills(
             else:
                 skills = list_skills_from_backend(backend=backend, source_path=".")
             if experimental and skills:
-                logger.info(
+                logger.debug(
                     "Discovered %d skill(s) from experimental Claude path: %s",
                     len(skills),
                     skill_dir,
@@ -280,12 +280,13 @@ def load_skill_content(
             skill_path,
         )
         from deepagents_code._env_vars import EXTRA_SKILLS_DIRS
+        from deepagents_code._paths import PATHS
 
         msg = (
             f"Skill path {skill_path} resolves outside all allowed skill "
             "directories. If this is a symlink, add the target directory to "
             f"{EXTRA_SKILLS_DIRS} or [skills].extra_allowed_dirs "
-            "in ~/.deepagents/config.toml."
+            f"in {PATHS.display(PATHS.profile.config_file)}."
         )
         raise PermissionError(msg)
 

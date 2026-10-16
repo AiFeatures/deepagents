@@ -6,8 +6,8 @@ This module tests the core file operations implemented in BaseSandbox:
 - read(): Read file contents with line numbers
 - edit(): String replacement in files
 - ls_info(): List directory contents
-- grep_raw(): Search for patterns
-- glob_info(): Pattern matching for files
+- grep(): Search for patterns
+- glob(): Pattern matching for files
 
 These tests use a LocalSubprocessSandbox that implements BaseSandbox
 and executes commands on the local machine using subprocess.
@@ -18,15 +18,19 @@ Linting exceptions:
 - ruff: noqa: S108 - /tmp paths are fine for these unit tests. These tests are only meant to run on CI.
 """
 
+import base64
+import hashlib
 import os
 import re
 import stat
 import subprocess
-from collections.abc import Iterator
+from collections.abc import Awaitable, Callable, Iterator
 from pathlib import Path
 
 import pytest
 from langchain.tools import ToolRuntime
+from langchain_core.messages import AIMessage, HumanMessage, ToolMessage
+from langchain_core.tools import BaseTool
 
 from deepagents.backends import CompositeBackend
 from deepagents.backends.filesystem import _map_exception_to_standard_error
@@ -42,7 +46,9 @@ from deepagents.backends.protocol import (
     WriteResult,
 )
 from deepagents.backends.sandbox import _EDIT_INLINE_MAX_BYTES, BaseSandbox
+from deepagents.graph import create_deep_agent
 from deepagents.middleware.filesystem import FilesystemMiddleware
+from tests.unit_tests.chat_model import GenericFakeChatModel
 
 # Skip all tests in this module unless RUN_SANDBOX_TESTS=true
 pytestmark = pytest.mark.skipif(
@@ -140,7 +146,7 @@ class LocalSubprocessSandbox(BaseSandbox):
                 truncated=False,
             )
 
-    def ls_info(self, path: str) -> list[FileInfo]:
+    def ls(self, path: str) -> LsResult:
         """List files while preserving virtual-path expectations in tests."""
         result = super().ls(self._to_real_path(path))
         if result.entries is not None:
@@ -150,10 +156,14 @@ class LocalSubprocessSandbox(BaseSandbox):
             result.error = self._to_virtual_path(result.error)
         return result
 
-    def read(self, file_path: str, offset: int = 0, limit: int = 2000) -> str:
+    def read(self, file_path: str, offset: int = 0, limit: int = 2000) -> ReadResult:
         """Read file content from the mapped real path."""
-        output = super().read(self._to_real_path(file_path), offset=offset, limit=limit)
-        return self._to_virtual_path(output)
+        result = super().read(self._to_real_path(file_path), offset=offset, limit=limit)
+        if result.error is not None:
+            result.error = self._to_virtual_path(result.error)
+        if result.file_data is not None:
+            result.file_data = {**result.file_data, "content": self._to_virtual_path(result.file_data["content"])}
+        return result
 
     def write(self, file_path: str, content: str) -> WriteResult:
         """Write file content to the mapped real path."""
@@ -184,14 +194,15 @@ class LocalSubprocessSandbox(BaseSandbox):
             result.error = self._to_virtual_path(result.error)
         return result
 
-    def grep_raw(self, pattern: str, path: str | None = None, glob: str | None = None) -> list[GrepMatch] | str:
+    def grep(self, pattern: str, path: str | None = None, glob: str | None = None) -> GrepResult:
         """Run grep against mapped real paths and return virtual paths."""
         mapped_path = self._to_real_path(path) if path is not None else None
-        result = super().grep_raw(pattern, path=mapped_path, glob=glob)
-        if isinstance(result, str):
-            return self._to_virtual_path(result)
-        for match in result:
-            match["path"] = self._to_virtual_path(match["path"])
+        result = super().grep(pattern, path=mapped_path, glob=glob)
+        if result.error is not None:
+            result.error = self._to_virtual_path(result.error)
+        if result.matches is not None:
+            for match in result.matches:
+                match["path"] = self._to_virtual_path(match["path"])
         return result
 
     def glob(self, pattern: str, path: str | None = None) -> GlobResult:
@@ -215,8 +226,9 @@ class LocalSubprocessSandbox(BaseSandbox):
         results: list[FileUploadResponse] = []
         for path, data in files:
             try:
-                Path(path).parent.mkdir(parents=True, exist_ok=True)
-                Path(path).write_bytes(data)
+                real_path = Path(self._to_real_path(path))
+                real_path.parent.mkdir(parents=True, exist_ok=True)
+                real_path.write_bytes(data)
                 results.append(FileUploadResponse(path=path, error=None))
             except Exception as exc:
                 error = _map_exception_to_standard_error(exc)
@@ -228,15 +240,15 @@ class LocalSubprocessSandbox(BaseSandbox):
     def download_files(self, paths: list[str]) -> list[FileDownloadResponse]:
         """Read files from the local filesystem."""
         results: list[FileDownloadResponse] = []
-        for real_path in paths:
+        for path in paths:
             try:
-                content = Path(real_path).read_bytes()
-                results.append(FileDownloadResponse(path=real_path, content=content, error=None))
+                content = Path(self._to_real_path(path)).read_bytes()
+                results.append(FileDownloadResponse(path=path, content=content, error=None))
             except Exception as exc:
                 error = _map_exception_to_standard_error(exc)
                 if error is None:
                     raise
-                results.append(FileDownloadResponse(path=real_path, content=None, error=error))
+                results.append(FileDownloadResponse(path=path, content=None, error=error))
         return results
 
 
@@ -389,12 +401,10 @@ class TestLocalSandboxOperations:
 
         result = sandbox.read(test_path)
 
-        assert "Error:" not in result
-        # Should have line numbers
-        assert "1\t" in result or "     1\t" in result
-        assert "Line 1" in result
-        assert "Line 2" in result
-        assert "Line 3" in result
+        assert result.error is None
+        content = result.file_data["content"]
+        # Backend returns raw content; line-number formatting is applied by middleware
+        assert content == "Line 1\nLine 2\nLine 3"
 
     def test_read_nonexistent_file(self, sandbox: LocalSubprocessSandbox) -> None:
         """Test reading a file that doesn't exist."""
@@ -402,8 +412,8 @@ class TestLocalSandboxOperations:
 
         result = sandbox.read(test_path)
 
-        assert "Error:" in result
-        assert "not found" in result.lower()
+        assert result.error is not None
+        assert "not_found" in result.error.lower() or "not found" in result.error.lower()
 
     def test_read_permission_denied(self, sandbox: LocalSubprocessSandbox) -> None:
         """Read on a chmod 000 file must surface permission_denied, not crash."""
@@ -437,7 +447,9 @@ class TestLocalSandboxOperations:
         result = sandbox.read(test_path)
 
         # Empty files should return a system reminder
-        assert "empty" in result.lower() or result.strip() == ""
+        assert result.error is None
+        content = result.file_data["content"]
+        assert "empty" in content.lower() or content.strip() == ""
 
     def test_read_with_offset(self, sandbox: LocalSubprocessSandbox) -> None:
         """Test reading a file with offset parameter."""
@@ -447,9 +459,11 @@ class TestLocalSandboxOperations:
 
         result = sandbox.read(test_path, offset=5)
 
+        assert result.error is None
+        content = result.file_data["content"]
         # Should start from line 6 (offset=5 means skip first 5 lines)
-        assert "Row_6_content" in result
-        assert "Row_1_content" not in result
+        assert "Row_6_content" in content
+        assert "Row_1_content" not in content
 
     def test_read_with_limit(self, sandbox: LocalSubprocessSandbox) -> None:
         """Test reading a file with limit parameter."""
@@ -459,10 +473,12 @@ class TestLocalSandboxOperations:
 
         result = sandbox.read(test_path, offset=0, limit=5)
 
+        assert result.error is None
+        content = result.file_data["content"]
         # Should only have first 5 lines
-        assert "Row_1_content" in result
-        assert "Row_5_content" in result
-        assert "Row_6_content" not in result
+        assert "Row_1_content" in content
+        assert "Row_5_content" in content
+        assert "Row_6_content" not in content
 
     def test_read_with_offset_and_limit(self, sandbox: LocalSubprocessSandbox) -> None:
         """Test reading a file with both offset and limit."""
@@ -472,11 +488,13 @@ class TestLocalSandboxOperations:
 
         result = sandbox.read(test_path, offset=10, limit=5)
 
+        assert result.error is None
+        content = result.file_data["content"]
         # Should have lines 11-15
-        assert "Row_11_content" in result
-        assert "Row_15_content" in result
-        assert "Row_10_content" not in result
-        assert "Row_16_content" not in result
+        assert "Row_11_content" in content
+        assert "Row_15_content" in content
+        assert "Row_10_content" not in content
+        assert "Row_16_content" not in content
 
     def test_read_unicode_content(self, sandbox: LocalSubprocessSandbox) -> None:
         """Test reading a file with unicode content."""
@@ -486,10 +504,11 @@ class TestLocalSandboxOperations:
 
         result = sandbox.read(test_path)
 
-        assert "Error:" not in result
-        assert "👋" in result
-        assert "世界" in result
-        assert "Привет" in result
+        assert result.error is None
+        content = result.file_data["content"]
+        assert "👋" in content
+        assert "世界" in content
+        assert "Привет" in content
 
     def test_read_file_with_very_long_lines(self, sandbox: LocalSubprocessSandbox) -> None:
         """Test reading a file with lines longer than 2000 characters."""
@@ -502,8 +521,9 @@ class TestLocalSandboxOperations:
         result = sandbox.read(test_path)
 
         # Should still read successfully (implementation may truncate)
-        assert "Error:" not in result
-        assert "Short line" in result
+        assert result.error is None
+        content = result.file_data["content"]
+        assert "Short line" in content
 
     def test_read_with_zero_limit(self, sandbox: LocalSubprocessSandbox) -> None:
         """Test reading with limit=0 returns nothing."""
@@ -514,7 +534,8 @@ class TestLocalSandboxOperations:
         result = sandbox.read(test_path, offset=0, limit=0)
 
         # Should return empty or no content lines
-        assert "Line 1" not in result or result.strip() == ""
+        content = result.file_data["content"] if result.file_data else ""
+        assert "Line 1" not in content or content.strip() == ""
 
     def test_read_offset_beyond_file_length(self, sandbox: LocalSubprocessSandbox) -> None:
         """Test reading with offset beyond the file length."""
@@ -524,11 +545,12 @@ class TestLocalSandboxOperations:
 
         result = sandbox.read(test_path, offset=100, limit=10)
 
-        # Should return empty result (no lines to read)
-        # Check that there's no actual content (only possible header/formatting)
-        assert "Line 1" not in result
-        assert "Line 2" not in result
-        assert "Line 3" not in result
+        # Should return empty result or error (no lines to read)
+        content = result.file_data["content"] if result.file_data else ""
+        error = result.error or ""
+        assert "Line 1" not in content and "Line 1" not in error
+        assert "Line 2" not in content and "Line 2" not in error
+        assert "Line 3" not in content and "Line 3" not in error
 
     def test_read_offset_at_exact_file_length(self, sandbox: LocalSubprocessSandbox) -> None:
         """Test reading with offset exactly at file length."""
@@ -539,8 +561,10 @@ class TestLocalSandboxOperations:
         result = sandbox.read(test_path, offset=5, limit=10)
 
         # Should return empty (offset=5 means skip first 5 lines)
-        assert "Line 1" not in result
-        assert "Line 5" not in result
+        content = result.file_data["content"] if result.file_data else ""
+        error = result.error or ""
+        assert "Line 1" not in content and "Line 1" not in error
+        assert "Line 5" not in content and "Line 5" not in error
 
     def test_read_very_large_file_in_chunks(self, sandbox: LocalSubprocessSandbox) -> None:
         """Test reading a large file in chunks using offset and limit."""
@@ -550,21 +574,27 @@ class TestLocalSandboxOperations:
         sandbox.write(test_path, content)
 
         # Read first chunk
-        chunk1 = sandbox.read(test_path, offset=0, limit=100)
-        assert "Line_0000_content" in chunk1
-        assert "Line_0099_content" in chunk1
-        assert "Line_0100_content" not in chunk1
+        r1 = sandbox.read(test_path, offset=0, limit=100)
+        assert r1.error is None
+        c1 = r1.file_data["content"]
+        assert "Line_0000_content" in c1
+        assert "Line_0099_content" in c1
+        assert "Line_0100_content" not in c1
 
         # Read middle chunk
-        chunk2 = sandbox.read(test_path, offset=500, limit=100)
-        assert "Line_0500_content" in chunk2
-        assert "Line_0599_content" in chunk2
-        assert "Line_0499_content" not in chunk2
+        r2 = sandbox.read(test_path, offset=500, limit=100)
+        assert r2.error is None
+        c2 = r2.file_data["content"]
+        assert "Line_0500_content" in c2
+        assert "Line_0599_content" in c2
+        assert "Line_0499_content" not in c2
 
         # Read last chunk
-        chunk3 = sandbox.read(test_path, offset=900, limit=100)
-        assert "Line_0900_content" in chunk3
-        assert "Line_0999_content" in chunk3
+        r3 = sandbox.read(test_path, offset=900, limit=100)
+        assert r3.error is None
+        c3 = r3.file_data["content"]
+        assert "Line_0900_content" in c3
+        assert "Line_0999_content" in c3
 
     # ==================== edit() tests ====================
 
@@ -579,7 +609,9 @@ class TestLocalSandboxOperations:
         assert result.error is None
         assert result.occurrences == 1
         # Verify change
-        file_content = sandbox.read(test_path)
+        read_result = sandbox.read(test_path)
+        assert read_result.error is None
+        file_content = read_result.file_data["content"]
         assert "Farewell world" in file_content
         assert "Goodbye" not in file_content
 
@@ -594,7 +626,9 @@ class TestLocalSandboxOperations:
         assert result.error is not None
         assert "multiple times" in result.error.lower()
         # Verify file unchanged
-        file_content = sandbox.read(test_path)
+        read_result = sandbox.read(test_path)
+        assert read_result.error is None
+        file_content = read_result.file_data["content"]
         assert "apple" in file_content
         assert "pear" not in file_content
 
@@ -609,7 +643,9 @@ class TestLocalSandboxOperations:
         assert result.error is None
         assert result.occurrences == 3
         # Verify all replaced
-        file_content = sandbox.read(test_path)
+        read_result = sandbox.read(test_path)
+        assert read_result.error is None
+        file_content = read_result.file_data["content"]
         assert "apple" not in file_content
         assert file_content.count("pear") == 3
 
@@ -660,7 +696,9 @@ class TestLocalSandboxOperations:
         assert result.error is None
 
         # Verify changes
-        file_content = sandbox.read(test_path)
+        read_result = sandbox.read(test_path)
+        assert read_result.error is None
+        file_content = read_result.file_data["content"]
         assert "$200.00" in file_content
         assert "[0-9]+" in file_content
 
@@ -676,7 +714,9 @@ class TestLocalSandboxOperations:
         assert result.error is None
         assert result.occurrences == 1
         # Verify the replacement worked correctly
-        file_content = sandbox.read(test_path)
+        read_result = sandbox.read(test_path)
+        assert read_result.error is None
+        file_content = read_result.file_data["content"]
         assert "Combined" in file_content
         assert "Line 3" in file_content
         assert "Line 1" not in file_content
@@ -691,7 +731,9 @@ class TestLocalSandboxOperations:
 
         assert result.error is None
         assert result.occurrences == 1
-        file_content = sandbox.read(test_path)
+        read_result = sandbox.read(test_path)
+        assert read_result.error is None
+        file_content = read_result.file_data["content"]
         assert "Keep this" in file_content
         assert "Keep this too" in file_content
         assert "Delete this part" not in file_content
@@ -707,7 +749,9 @@ class TestLocalSandboxOperations:
         # Should succeed with 1 occurrence
         assert result.error is None
         assert result.occurrences == 1
-        file_content = sandbox.read(test_path)
+        read_result = sandbox.read(test_path)
+        assert read_result.error is None
+        file_content = read_result.file_data["content"]
         assert "Same text" in file_content
 
     def test_edit_unicode_content(self, sandbox: LocalSubprocessSandbox) -> None:
@@ -720,7 +764,9 @@ class TestLocalSandboxOperations:
 
         assert result.error is None
         assert result.occurrences == 1
-        file_content = sandbox.read(test_path)
+        read_result = sandbox.read(test_path)
+        assert read_result.error is None
+        file_content = read_result.file_data["content"]
         assert "🌍" in file_content
         assert "👋" not in file_content
 
@@ -734,7 +780,9 @@ class TestLocalSandboxOperations:
 
         assert result.error is None
         assert result.occurrences == 1
-        file_content = sandbox.read(test_path)
+        read_result = sandbox.read(test_path)
+        assert read_result.error is None
+        file_content = read_result.file_data["content"]
         assert "Line1 Line2" in file_content
 
     def test_edit_with_very_long_strings(self, sandbox: LocalSubprocessSandbox) -> None:
@@ -749,7 +797,9 @@ class TestLocalSandboxOperations:
 
         assert result.error is None
         assert result.occurrences == 1
-        file_content = sandbox.read(test_path)
+        read_result = sandbox.read(test_path)
+        assert read_result.error is None
+        file_content = read_result.file_data["content"]
         assert "y" * 100 in file_content  # Check partial presence
         assert "x" * 100 not in file_content
 
@@ -762,7 +812,9 @@ class TestLocalSandboxOperations:
         result = sandbox.edit(test_path, "Line 2", "Modified Line 2")
 
         assert result.error is None
-        file_content = sandbox.read(test_path)
+        read_result = sandbox.read(test_path)
+        assert read_result.error is None
+        file_content = read_result.file_data["content"]
         assert "Line 1" in file_content
         assert "Modified Line 2" in file_content
         assert "Line 3" in file_content
@@ -777,7 +829,9 @@ class TestLocalSandboxOperations:
 
         assert result.error is None
         assert result.occurrences == 1
-        file_content = sandbox.read(test_path)
+        read_result = sandbox.read(test_path)
+        assert read_result.error is None
+        file_content = read_result.file_data["content"]
         assert "red cat" in file_content
         assert "The quick red cat jumps" in file_content
 
@@ -977,7 +1031,8 @@ class TestLocalSandboxOperations:
         base_dir = "/tmp/test_sandbox_ops/ls_absolute"
         sandbox.execute(f"mkdir -p {base_dir}")
         sandbox.write(f"{base_dir}/file.txt", "content")
-        result = sandbox.ls_info(base_dir)
+        result = sandbox.ls(base_dir).entries
+        assert result is not None
         assert len(result) == 1
         assert result[0]["path"] == "/tmp/test_sandbox_ops/ls_absolute/file.txt"
 
@@ -989,8 +1044,9 @@ class TestLocalSandboxOperations:
         sandbox.write(f"{base_dir}/file2.txt", "content2")
         sandbox.execute(f"mkdir -p {base_dir}/subdir")
 
-        result = sandbox.ls_info(base_dir)
+        result = sandbox.ls(base_dir).entries
 
+        assert result is not None
         assert len(result) == 3
         paths = [info["path"] for info in result]
         assert f"{base_dir}/file1.txt" in paths
@@ -1008,15 +1064,15 @@ class TestLocalSandboxOperations:
         empty_dir = "/tmp/test_sandbox_ops/empty_dir"
         sandbox.execute(f"mkdir -p {empty_dir}")
 
-        result = sandbox.ls_info(empty_dir)
+        result = sandbox.ls(empty_dir)
 
-        assert result == []
+        assert result.entries == []
 
     def test_ls_info_nonexistent_directory(self, sandbox: LocalSubprocessSandbox) -> None:
         """Ls on a missing path must surface the failure on .error, not return []."""
         nonexistent_dir = "/tmp/test_sandbox_ops/does_not_exist"
 
-        result = sandbox.ls_info(nonexistent_dir)
+        result = sandbox.ls(nonexistent_dir)
 
         assert result.entries is None
         assert result.error == f"Path '{nonexistent_dir}': path_not_found"
@@ -1039,8 +1095,9 @@ class TestLocalSandboxOperations:
         sandbox.write(f"{base_dir}/.hidden", "hidden content")
         sandbox.write(f"{base_dir}/visible.txt", "visible content")
 
-        result = sandbox.ls_info(base_dir)
+        result = sandbox.ls(base_dir).entries
 
+        assert result is not None
         paths = [info["path"] for info in result]
         assert f"{base_dir}/.hidden" in paths
         assert f"{base_dir}/visible.txt" in paths
@@ -1052,8 +1109,9 @@ class TestLocalSandboxOperations:
         sandbox.write(f"{base_dir}/file with spaces.txt", "content")
         sandbox.execute(f"mkdir -p '{base_dir}/dir with spaces'")
 
-        result = sandbox.ls_info(base_dir)
+        result = sandbox.ls(base_dir).entries
 
+        assert result is not None
         paths = [info["path"] for info in result]
         assert f"{base_dir}/file with spaces.txt" in paths
         assert f"{base_dir}/dir with spaces" in paths
@@ -1065,8 +1123,9 @@ class TestLocalSandboxOperations:
         sandbox.write(f"{base_dir}/测试文件.txt", "content")
         sandbox.write(f"{base_dir}/файл.txt", "content")
 
-        result = sandbox.ls_info(base_dir)
+        result = sandbox.ls(base_dir).entries
 
+        assert result is not None
         paths = [info["path"] for info in result]
         # Should contain the unicode filenames
         assert len(paths) == 2
@@ -1078,8 +1137,9 @@ class TestLocalSandboxOperations:
         # Note: Using $(seq 0 49) instead of {0..49} for better shell compatibility
         sandbox.execute(f"mkdir -p {base_dir} && cd {base_dir} && for i in $(seq 0 49); do echo 'content' > file_$(printf '%03d' $i).txt; done")
 
-        result = sandbox.ls_info(base_dir)
+        result = sandbox.ls(base_dir).entries
 
+        assert result is not None
         assert len(result) == 50
         paths = [info["path"] for info in result]
         assert f"{base_dir}/file_000.txt" in paths
@@ -1092,9 +1152,10 @@ class TestLocalSandboxOperations:
         sandbox.write(f"{base_dir}/file.txt", "content")
 
         # List with trailing slash
-        result = sandbox.ls_info(f"{base_dir}/")
+        result = sandbox.ls(f"{base_dir}/").entries
 
         # Should work the same as without trailing slash
+        assert result is not None
         assert len(result) >= 1 or result == []  # Implementation dependent
 
     def test_ls_info_special_characters_in_filenames(self, sandbox: LocalSubprocessSandbox) -> None:
@@ -1106,8 +1167,9 @@ class TestLocalSandboxOperations:
         sandbox.write(f"{base_dir}/file[2].txt", "content")
         sandbox.write(f"{base_dir}/file-3.txt", "content")
 
-        result = sandbox.ls_info(base_dir)
+        result = sandbox.ls(base_dir).entries
 
+        assert result is not None
         paths = [info["path"] for info in result]
         assert f"{base_dir}/file(1).txt" in paths
         assert f"{base_dir}/file[2].txt" in paths
@@ -1136,10 +1198,10 @@ class TestLocalSandboxOperations:
         """
         malicious_path = "'; import os; os.system('echo INJECTED'); #"
         result = sandbox.read(malicious_path)
-        assert "Error: File" in result
-        assert "INJECTED" in result
+        assert result.error is not None
+        assert result.file_data is None
 
-    # ==================== grep_raw() tests ====================
+    # ==================== grep() tests ====================
 
     def test_grep_basic_search(self, sandbox: LocalSubprocessSandbox) -> None:
         """Test basic grep search for a literal pattern (not regex)."""
@@ -1148,9 +1210,9 @@ class TestLocalSandboxOperations:
         sandbox.write(f"{base_dir}/file1.txt", "Hello world\nGoodbye world")
         sandbox.write(f"{base_dir}/file2.txt", "Hello there\nGoodbye friend")
 
-        result = sandbox.grep_raw("Hello", path=base_dir)
+        result = sandbox.grep("Hello", path=base_dir).matches
 
-        assert isinstance(result, list)
+        assert result is not None
         assert len(result) == 2
         # Check that both files matched
         paths = [match["path"] for match in result]
@@ -1169,9 +1231,9 @@ class TestLocalSandboxOperations:
         sandbox.write(f"{base_dir}/test.py", "pattern")
         sandbox.write(f"{base_dir}/test.md", "pattern")
 
-        result = sandbox.grep_raw("pattern", path=base_dir, glob="*.py")
+        result = sandbox.grep("pattern", path=base_dir, glob="*.py").matches
 
-        assert isinstance(result, list)
+        assert result is not None
         assert len(result) == 1
         assert "test.py" in result[0]["path"]
 
@@ -1181,9 +1243,9 @@ class TestLocalSandboxOperations:
         sandbox.execute(f"mkdir -p {base_dir}")
         sandbox.write(f"{base_dir}/file.txt", "Hello world")
 
-        result = sandbox.grep_raw("nonexistent", path=base_dir)
+        result = sandbox.grep("nonexistent", path=base_dir).matches
 
-        assert isinstance(result, list)
+        assert result is not None
         assert len(result) == 0
 
     def test_grep_multiple_matches_per_file(self, sandbox: LocalSubprocessSandbox) -> None:
@@ -1193,9 +1255,9 @@ class TestLocalSandboxOperations:
         content = "apple\nbanana\napple\norange\napple"
         sandbox.write(f"{base_dir}/fruits.txt", content)
 
-        result = sandbox.grep_raw("apple", path=base_dir)
+        result = sandbox.grep("apple", path=base_dir).matches
 
-        assert isinstance(result, list)
+        assert result is not None
         assert len(result) == 3
         # Check line numbers
         line_numbers = [match["line"] for match in result]
@@ -1208,9 +1270,9 @@ class TestLocalSandboxOperations:
         sandbox.write(f"{base_dir}/numbers.txt", "test123\ntest456\nabcdef")
 
         # Pattern is treated as literal string, not regex
-        result = sandbox.grep_raw("test123", path=base_dir)
+        result = sandbox.grep("test123", path=base_dir).matches
 
-        assert isinstance(result, list)
+        assert result is not None
         assert len(result) == 1
         assert "test123" in result[0]["text"]
 
@@ -1220,9 +1282,9 @@ class TestLocalSandboxOperations:
         sandbox.execute(f"mkdir -p {base_dir}")
         sandbox.write(f"{base_dir}/unicode.txt", "Hello 世界\nПривет мир\n测试 pattern")
 
-        result = sandbox.grep_raw("世界", path=base_dir)
+        result = sandbox.grep("世界", path=base_dir).matches
 
-        assert isinstance(result, list)
+        assert result is not None
         assert len(result) == 1
         assert "世界" in result[0]["text"]
 
@@ -1232,9 +1294,9 @@ class TestLocalSandboxOperations:
         sandbox.execute(f"mkdir -p {base_dir}")
         sandbox.write(f"{base_dir}/case.txt", "Hello\nhello\nHELLO")
 
-        result = sandbox.grep_raw("Hello", path=base_dir)
+        result = sandbox.grep("Hello", path=base_dir).matches
 
-        assert isinstance(result, list)
+        assert result is not None
         # Should only match "Hello", not "hello" or "HELLO"
         assert len(result) == 1
         assert "Hello" in result[0]["text"]
@@ -1246,14 +1308,14 @@ class TestLocalSandboxOperations:
         sandbox.write(f"{base_dir}/special.txt", "Price: $100\nPath: /usr/bin\nPattern: [a-z]*")
 
         # Test with dollar sign (treated as literal)
-        result = sandbox.grep_raw("$100", path=base_dir)
-        assert isinstance(result, list)
+        result = sandbox.grep("$100", path=base_dir).matches
+        assert result is not None
         assert len(result) == 1
         assert "$100" in result[0]["text"]
 
         # Test with brackets (treated as literal)
-        result = sandbox.grep_raw("[a-z]*", path=base_dir)
-        assert isinstance(result, list)
+        result = sandbox.grep("[a-z]*", path=base_dir).matches
+        assert result is not None
         assert len(result) == 1
         assert "[a-z]*" in result[0]["text"]
 
@@ -1262,9 +1324,9 @@ class TestLocalSandboxOperations:
         base_dir = "/tmp/test_sandbox_ops/grep_empty_dir"
         sandbox.execute(f"mkdir -p {base_dir}")
 
-        result = sandbox.grep_raw("anything", path=base_dir)
+        result = sandbox.grep("anything", path=base_dir).matches
 
-        assert isinstance(result, list)
+        assert result is not None
         assert len(result) == 0
 
     def test_grep_across_nested_directories(self, sandbox: LocalSubprocessSandbox) -> None:
@@ -1275,9 +1337,9 @@ class TestLocalSandboxOperations:
         sandbox.write(f"{base_dir}/sub1/level1.txt", "target here")
         sandbox.write(f"{base_dir}/sub1/sub2/level2.txt", "target here")
 
-        result = sandbox.grep_raw("target", path=base_dir)
+        result = sandbox.grep("target", path=base_dir).matches
 
-        assert isinstance(result, list)
+        assert result is not None
         assert len(result) == 3
         # Should find matches in all nested levels
 
@@ -1287,7 +1349,7 @@ class TestLocalSandboxOperations:
         sandbox.write(f"{base_dir}/a/b/target.py", "needle")
         sandbox.write(f"{base_dir}/a/ignore.txt", "needle")
 
-        result = sandbox.grep_raw("needle", path=base_dir, glob="*.py")
+        result = sandbox.grep("needle", path=base_dir, glob="*.py").matches
 
         assert result == [{"path": f"{base_dir}/a/b/target.py", "line": 1, "text": "needle"}]
 
@@ -1298,13 +1360,13 @@ class TestLocalSandboxOperations:
         content = "\n".join([f"Line {i}" for i in range(1, 101)])
         sandbox.write(f"{base_dir}/long.txt", content)
 
-        result = sandbox.grep_raw("Line 50", path=base_dir)
+        result = sandbox.grep("Line 50", path=base_dir).matches
 
-        assert isinstance(result, list)
+        assert result is not None
         assert len(result) == 1
         assert result[0]["line"] == 50
 
-    # ==================== glob_info() tests ====================
+    # ==================== glob() tests ====================
 
     def test_glob_basic_pattern(self, sandbox: LocalSubprocessSandbox) -> None:
         """Test glob with basic wildcard pattern."""
@@ -1314,12 +1376,13 @@ class TestLocalSandboxOperations:
         sandbox.write(f"{base_dir}/file2.txt", "content")
         sandbox.write(f"{base_dir}/file3.py", "content")
 
-        result = sandbox.glob_info("*.txt", path=base_dir)
+        result = sandbox.glob("*.txt", path=base_dir).matches
 
+        assert result is not None
         assert len(result) == 2
         paths = [info["path"] for info in result]
-        assert "file1.txt" in paths
-        assert "file2.txt" in paths
+        assert f"{base_dir}/file1.txt" in paths
+        assert f"{base_dir}/file2.txt" in paths
         assert not any(".py" in p for p in paths)
 
     def test_glob_recursive_pattern(self, sandbox: LocalSubprocessSandbox) -> None:
@@ -1330,8 +1393,9 @@ class TestLocalSandboxOperations:
         sandbox.write(f"{base_dir}/subdir1/nested1.txt", "content")
         sandbox.write(f"{base_dir}/subdir2/nested2.txt", "content")
 
-        result = sandbox.glob_info("**/*.txt", path=base_dir)
+        result = sandbox.glob("**/*.txt", path=base_dir).matches
 
+        assert result is not None
         assert len(result) >= 2  # At least the nested files
         paths = [info["path"] for info in result]
         assert any("nested1.txt" in p for p in paths)
@@ -1343,24 +1407,24 @@ class TestLocalSandboxOperations:
         sandbox.execute(f"mkdir -p {base_dir}")
         sandbox.write(f"{base_dir}/file.txt", "content")
 
-        result = sandbox.glob_info("*.py", path=base_dir)
+        result = sandbox.glob("*.py", path=base_dir).matches
 
         assert result == []
 
     def test_glob_with_directories(self, sandbox: LocalSubprocessSandbox) -> None:
-        """Test that glob includes directories in results."""
+        """Glob filters out directories and only returns regular files."""
         base_dir = "/tmp/test_sandbox_ops/glob_dirs"
         sandbox.execute(f"mkdir -p {base_dir}/dir1 {base_dir}/dir2")
         sandbox.write(f"{base_dir}/file.txt", "content")
 
-        result = sandbox.glob_info("*", path=base_dir)
+        result = sandbox.glob("*", path=base_dir).matches
 
-        assert len(result) == 3
-        # Check is_dir flags
-        dir_count = sum(1 for info in result if info["is_dir"])
+        assert result is not None
+        assert len(result) == 1
+        # All results must be regular files
         file_count = sum(1 for info in result if not info["is_dir"])
-        assert dir_count == 2
         assert file_count == 1
+        assert result[0]["path"] == f"{base_dir}/file.txt"
 
     def test_glob_specific_extension(self, sandbox: LocalSubprocessSandbox) -> None:
         """Test glob with specific file extension pattern."""
@@ -1370,8 +1434,9 @@ class TestLocalSandboxOperations:
         sandbox.write(f"{base_dir}/test.txt", "content")
         sandbox.write(f"{base_dir}/test.md", "content")
 
-        result = sandbox.glob_info("*.py", path=base_dir)
+        result = sandbox.glob("*.py", path=base_dir).matches
 
+        assert result is not None
         assert len(result) == 1
         assert "test.py" in result[0]["path"]
 
@@ -1383,11 +1448,12 @@ class TestLocalSandboxOperations:
         sandbox.write(f"{base_dir}/.hidden2", "content")
         sandbox.write(f"{base_dir}/visible.txt", "content")
 
-        result = sandbox.glob_info(".*", path=base_dir)
+        result = sandbox.glob(".*", path=base_dir).matches
 
+        assert result is not None
         # Should only match hidden files
         paths = [info["path"] for info in result]
-        assert ".hidden1" in paths or ".hidden2" in paths
+        assert f"{base_dir}/.hidden1" in paths or f"{base_dir}/.hidden2" in paths
         # Should not match visible.txt
         assert not any("visible" in p for p in paths)
 
@@ -1400,14 +1466,15 @@ class TestLocalSandboxOperations:
         sandbox.write(f"{base_dir}/file3.txt", "content")
         sandbox.write(f"{base_dir}/fileA.txt", "content")
 
-        result = sandbox.glob_info("file[1-2].txt", path=base_dir)
+        result = sandbox.glob("file[1-2].txt", path=base_dir).matches
 
+        assert result is not None
         assert len(result) == 2
         paths = [info["path"] for info in result]
-        assert "file1.txt" in paths
-        assert "file2.txt" in paths
-        assert "file3.txt" not in paths
-        assert "fileA.txt" not in paths
+        assert f"{base_dir}/file1.txt" in paths
+        assert f"{base_dir}/file2.txt" in paths
+        assert f"{base_dir}/file3.txt" not in paths
+        assert f"{base_dir}/fileA.txt" not in paths
 
     def test_glob_with_question_mark(self, sandbox: LocalSubprocessSandbox) -> None:
         """Test glob with single character wildcard (?)."""
@@ -1417,8 +1484,9 @@ class TestLocalSandboxOperations:
         sandbox.write(f"{base_dir}/file2.txt", "content")
         sandbox.write(f"{base_dir}/file10.txt", "content")
 
-        result = sandbox.glob_info("file?.txt", path=base_dir)
+        result = sandbox.glob("file?.txt", path=base_dir).matches
 
+        assert result is not None
         # Should match file1.txt and file2.txt, but not file10.txt
         assert len(result) == 2
         paths = [info["path"] for info in result]
@@ -1434,10 +1502,12 @@ class TestLocalSandboxOperations:
         sandbox.write(f"{base_dir}/file.js", "content")
 
         # Using separate patterns (implementation may support brace expansion)
-        result_txt = sandbox.glob_info("*.txt", path=base_dir)
-        result_py = sandbox.glob_info("*.py", path=base_dir)
+        result_txt = sandbox.glob("*.txt", path=base_dir).matches
+        result_py = sandbox.glob("*.py", path=base_dir).matches
 
+        assert result_txt is not None
         assert len(result_txt) == 1
+        assert result_py is not None
         assert len(result_py) == 1
 
     def test_glob_deeply_nested_pattern(self, sandbox: LocalSubprocessSandbox) -> None:
@@ -1447,8 +1517,9 @@ class TestLocalSandboxOperations:
         sandbox.write(f"{base_dir}/a/b/c/d/deep.txt", "content")
         sandbox.write(f"{base_dir}/a/b/other.txt", "content")
 
-        result = sandbox.glob_info("**/deep.txt", path=base_dir)
+        result = sandbox.glob("**/deep.txt", path=base_dir).matches
 
+        assert result is not None
         assert len(result) >= 1
         # Should find the deeply nested file
 
@@ -1459,10 +1530,10 @@ class TestLocalSandboxOperations:
         sandbox.write(f"{base_dir}/file.txt", "content")
 
         # Call with explicit path to match expected signature
-        result = sandbox.glob_info("*.txt", path=base_dir)
+        result = sandbox.glob("*.txt", path=base_dir)
 
         # Should work with explicit path
-        assert isinstance(result, list)
+        assert result.matches is not None
 
     def test_glob_path_not_found(self, sandbox: LocalSubprocessSandbox) -> None:
         """Glob on a missing search path must surface path_not_found, not crash."""
@@ -1497,15 +1568,18 @@ class TestLocalSandboxOperations:
         assert write_result.error is None
 
         # Read it back
-        content = sandbox.read(test_path)
-        assert "Original content" in content
+        read_result = sandbox.read(test_path)
+        assert read_result.error is None
+        assert "Original content" in read_result.file_data["content"]
 
         # Edit it
         edit_result = sandbox.edit(test_path, "Original", "Modified")
         assert edit_result.error is None
 
         # Read again to verify
-        updated_content = sandbox.read(test_path)
+        read_result2 = sandbox.read(test_path)
+        assert read_result2.error is None
+        updated_content = read_result2.file_data["content"]
         assert "Modified content" in updated_content
         assert "Original" not in updated_content
 
@@ -1520,23 +1594,44 @@ class TestLocalSandboxOperations:
         sandbox.write(f"{base_dir}/subdir2/file3.txt", "file 3")
 
         # List root directory
-        ls_result = sandbox.ls_info(base_dir)
+        ls_result = sandbox.ls(base_dir).entries
+        assert ls_result is not None
         paths = [info["path"] for info in ls_result]
         assert f"{base_dir}/root.txt" in paths
         assert f"{base_dir}/subdir1" in paths
         assert f"{base_dir}/subdir2" in paths
 
         # Glob for txt files
-        glob_result = sandbox.glob_info("**/*.txt", path=base_dir)
+        glob_result = sandbox.glob("**/*.txt", path=base_dir).matches
+        assert glob_result is not None
         assert len(glob_result) == 3
 
         # Grep for a pattern
-        grep_result = sandbox.grep_raw("file", path=base_dir)
+        grep_result = sandbox.grep("file", path=base_dir).matches
+        assert grep_result is not None
         assert len(grep_result) >= 3  # At least 3 matches
 
 
 # 5000 of these lines (~250 KB) clear the default eviction budget (~80 KB).
 _BIG_OUTPUT_CMD = 'for i in $(seq 1 5000); do echo "line $i: padding text to make the output long enough to offload"; done'
+
+# ~120 KB over only 3 lines: clears the eviction budget, but has fewer lines than
+# the wrapper's head+tail budget, so there is no middle to drop. The wrapper falls
+# back to a leading byte excerpt (the meta field is a negative surplus, -7) and
+# closes it with the in-band clip notice instead of a truncation marker.
+_FEW_LONG_LINES_CMD = "for i in 1 2 3; do printf 'line %s: ' \"$i\"; head -c 40000 /dev/zero | tr '\\0' x; echo; done"
+
+# 20 lines of 3 KB each: more lines than the head+tail budget, so this takes the
+# head/tail branch -- but `head -c 2000`/`tail -c 2000` bite before the line caps,
+# so the excerpts show fewer than 5 lines each and cut the outermost ones mid-line.
+# The truncation marker counts only whole middle lines, so that extra loss has to be
+# disclosed in-band.
+_MANY_LONG_LINES_CMD = "for i in $(seq 1 20); do printf 'line %s: ' \"$i\"; head -c 3000 /dev/zero | tr '\\0' x; echo; done"
+
+# 200 KB on a single line (no newlines at all). Paired with a 5 KB capture cap it
+# is both capped and too few lines for the head/tail branch, so the byte excerpt
+# has to report the cap rather than the output's real size.
+_ONE_HUGE_LINE_CMD = 'head -c 200000 /dev/zero | tr "\\0" x'
 
 
 class TestExecuteCaptureOffload:
@@ -1576,13 +1671,42 @@ class TestExecuteCaptureOffload:
             config={},
         )
 
+    @pytest.fixture(params=["sync", "async"])
+    def invoke(self, request: pytest.FixtureRequest) -> Callable[[BaseTool, dict], Awaitable[ToolMessage]]:
+        """Drive a tool through either `invoke` or `ainvoke`.
+
+        The execute tool forks on sync/async well before the backend does:
+        `sync_execute` calls `execute_with_offload` while `async_execute` calls
+        `aexecute_with_offload`, so each branch builds its own `ToolMessage` and
+        neither covers the other. Running every case both ways closes that gap
+        for free -- `BaseSandbox.aexecute` delegates to `execute` in a thread,
+        so the async path needs no extra backend support.
+        """
+        if request.param == "async":
+            return lambda tool, payload: tool.ainvoke(payload)
+
+        async def invoke_sync(tool: BaseTool, payload: dict) -> ToolMessage:
+            return tool.invoke(payload)
+
+        return invoke_sync
+
     @staticmethod
     def _capture_path(tool_call_id: str) -> str:
         return f"{VIRTUAL_SANDBOX_ROOT}/large_tool_results/{tool_call_id}"
 
-    def test_small_output_returned_inline_and_leaves_no_file(self, tools: tuple, sandbox: LocalSubprocessSandbox) -> None:
+    async def test_large_output_truncates_visible_tool_call_id(self, tools: tuple, invoke: Callable) -> None:
         execute_tool, _ = tools
-        result = execute_tool.invoke({"command": "echo hello", "runtime": self._runtime("c_small")})
+        tool_call_id = "c_" + "thought_signature" * 100
+        result = await invoke(execute_tool, {"command": _BIG_OUTPUT_CMD, "runtime": self._runtime(tool_call_id)})
+
+        assert result.tool_call_id == tool_call_id
+        assert f"{tool_call_id[:32]}..." in result.content
+        assert tool_call_id not in result.content
+        assert "large_tool_results/call-" in result.content
+
+    async def test_small_output_returned_inline_and_leaves_no_file(self, tools: tuple, sandbox: LocalSubprocessSandbox, invoke: Callable) -> None:
+        execute_tool, _ = tools
+        result = await invoke(execute_tool, {"command": "echo hello", "runtime": self._runtime("c_small")})
 
         assert "hello" in result.content
         assert "exit code 0" in result.content
@@ -1591,10 +1715,10 @@ class TestExecuteCaptureOffload:
         listing = sandbox.execute(f"ls {VIRTUAL_SANDBOX_ROOT}/large_tool_results/ 2>/dev/null | wc -l")
         assert listing.output.strip() == "0"
 
-    def test_large_output_offloads_and_full_content_roundtrips(self, tools: tuple) -> None:
+    async def test_large_output_offloads_and_full_content_roundtrips(self, tools: tuple, invoke: Callable) -> None:
         execute_tool, read_tool = tools
         rt = self._runtime("c_large")
-        result = execute_tool.invoke({"command": _BIG_OUTPUT_CMD, "runtime": rt})
+        result = await invoke(execute_tool, {"command": _BIG_OUTPUT_CMD, "runtime": rt})
 
         capture_path = self._capture_path("c_large")
         # Preview + pointer, not the full output inline.
@@ -1605,20 +1729,168 @@ class TestExecuteCaptureOffload:
         assert "lines truncated" in result.content
         # A middle line is absent from the preview...
         assert "line 2500:" not in result.content
+        # ...and the note explains the marker standing in for it. Asserted on the
+        # note's own wording rather than "lines truncated", which the note quotes
+        # and so matches whether or not a marker was inserted.
+        assert "lines of the form" in result.content
 
         # ...but recoverable in full via read_file on the offload path: a middle
         # slice the preview never showed is present on disk.
         read = read_tool.invoke({"file_path": capture_path, "offset": 2499, "limit": 3, "runtime": rt})
         assert "line 2500:" in read.content
 
-    def test_nonzero_exit_code_preserved(self, tools: tuple) -> None:
+    def test_offloaded_preview_reports_truncation_marker(self, sandbox: LocalSubprocessSandbox) -> None:
+        offload = sandbox.execute_with_offload(_BIG_OUTPUT_CMD, self._capture_path("c_omit"), max_inline_bytes=100)
+
+        assert offload.offloaded is True
+        assert offload.preview_has_truncation_marker is True
+        assert "lines truncated] ..." in offload.response.output
+
+    def test_offloaded_byte_excerpt_reports_no_marker_but_says_it_clipped(self, tools: tuple, sandbox: LocalSubprocessSandbox) -> None:
+        """Few-but-huge lines: no marker to explain, yet the end is still dropped."""
+        offload = sandbox.execute_with_offload(_FEW_LONG_LINES_CMD, self._capture_path("c_few"), max_inline_bytes=100)
+
+        assert offload.offloaded is True
+        assert offload.preview_has_truncation_marker is False
+        # No marker is claimed because none was inserted...
+        assert "lines truncated" not in offload.response.output
+        # ...but the excerpt drops the end of the output, so it says so in-band.
+        assert "output clipped here" in offload.response.output
+        assert "full output at the path above" in offload.response.output
+
+        # The tool message therefore drops the truncation-marker explanation while
+        # the body still discloses the clip.
         execute_tool, _ = tools
-        result = execute_tool.invoke({"command": "echo oops; exit 3", "runtime": self._runtime("c_ec")})
+        result = execute_tool.invoke({"command": _FEW_LONG_LINES_CMD, "runtime": self._runtime("c_few_tool")})
+        assert "Here is a preview of the result:" in result.content
+        assert "lines of the form" not in result.content
+        assert "output clipped here" in result.content
+
+    def test_capped_byte_excerpt_does_not_claim_the_path_holds_the_full_output(self, sandbox: LocalSubprocessSandbox) -> None:
+        """When capture hits its cap, neither the byte count nor the path is the whole story.
+
+        The wrapper only ever sees the capped file, so its byte count is the cap
+        rather than the command's real output size, and the saved file is itself
+        incomplete. The notice must not contradict the `truncated` status line the
+        caller renders next to it.
+        """
+        offload = sandbox.execute_with_offload(
+            _ONE_HUGE_LINE_CMD,
+            self._capture_path("c_capped"),
+            max_inline_bytes=100,
+            max_capture_bytes=5000,
+        )
+
+        assert offload.offloaded is True
+        assert offload.response.truncated is True
+        assert offload.preview_has_truncation_marker is False
+
+        notice = offload.response.output.splitlines()[-1]
+        assert "capture stopped at its 5000-byte limit" in notice
+        # The real output was 200000 bytes, so the cap must not be sold as the total...
+        assert "5000 bytes total" not in notice
+        # ...and the saved file is incomplete, so it must not be sold as the full output.
+        assert "full output at the path above" not in notice
+        assert "incomplete" in notice
+
+    def test_uncapped_byte_excerpt_reports_the_true_total_and_full_recovery(self, sandbox: LocalSubprocessSandbox) -> None:
+        """Below the cap, the captured file really is the whole output."""
+        offload = sandbox.execute_with_offload(_FEW_LONG_LINES_CMD, self._capture_path("c_uncapped"), max_inline_bytes=100)
+
+        assert offload.response.truncated is False
+        notice = offload.response.output.splitlines()[-1]
+        assert "bytes total, full output at the path above" in notice
+        assert "capture stopped at its" not in notice
+
+    def test_capped_head_tail_preview_has_no_clip_notice(self, sandbox: LocalSubprocessSandbox) -> None:
+        """The clip notice belongs to the byte-excerpt branch only, capped or not."""
+        offload = sandbox.execute_with_offload(
+            _BIG_OUTPUT_CMD,
+            self._capture_path("c_capped_marker"),
+            max_inline_bytes=100,
+            max_capture_bytes=5000,
+        )
+
+        assert offload.response.truncated is True
+        assert offload.preview_has_truncation_marker is True
+        assert "output clipped here" not in offload.response.output
+
+    def test_offloaded_preview_shorter_than_excerpt_budget_omits_clip_notice(self, sandbox: LocalSubprocessSandbox) -> None:
+        """Output above the inline budget but below the excerpt budget loses nothing."""
+        cmd = 'printf "a\\nb\\nc\\n"; head -c 300 /dev/zero | tr "\\0" x; echo'
+        offload = sandbox.execute_with_offload(cmd, self._capture_path("c_fits"), max_inline_bytes=100)
+
+        assert offload.offloaded is True
+        assert offload.preview_has_truncation_marker is False
+        # Nothing was dropped, so neither notice appears.
+        assert "lines truncated" not in offload.response.output
+        assert "output clipped here" not in offload.response.output
+
+    def test_head_tail_excerpts_disclose_their_byte_caps(self, sandbox: LocalSubprocessSandbox) -> None:
+        """Long lines make the head/tail excerpts lose content the marker never counts.
+
+        `head -c`/`tail -c` run before the line caps, so the outermost shown lines are
+        cut mid-line and fewer lines appear than the budget. The marker only accounts
+        for whole middle lines, so the preview must say the rest out loud.
+        """
+        offload = sandbox.execute_with_offload(_MANY_LONG_LINES_CMD, self._capture_path("c_ht_clip"), max_inline_bytes=100)
+
+        assert offload.offloaded is True
+        assert offload.preview_has_truncation_marker is True
+        assert "byte-capped" in offload.response.output
+        # The marker keeps its own line rather than being glued onto a mid-line cut.
+        marker_lines = [line for line in offload.response.output.splitlines() if line.startswith("... [") and "lines truncated" in line]
+        assert len(marker_lines) == 1
+
+    def test_head_tail_excerpts_stay_quiet_when_byte_caps_do_not_bite(self, sandbox: LocalSubprocessSandbox) -> None:
+        """Short lines fit inside the byte caps, so there is no extra loss to disclose."""
+        offload = sandbox.execute_with_offload(_BIG_OUTPUT_CMD, self._capture_path("c_ht_noclip"), max_inline_bytes=100)
+
+        assert offload.preview_has_truncation_marker is True
+        assert "byte-capped" not in offload.response.output
+
+    def test_capped_byte_excerpt_notice_agrees_with_the_status_line(self, sandbox: LocalSubprocessSandbox) -> None:
+        """The capped wording exists to not contradict the `truncated` status line.
+
+        That pairing is the whole reason for the variant, so assert both halves on the
+        composed message rather than only on the raw backend value.
+        """
+        capture_path = self._capture_path("c_capped_msg")
+        offload = sandbox.execute_with_offload(_ONE_HUGE_LINE_CMD, capture_path, max_inline_bytes=100, max_capture_bytes=5000)
+
+        middleware = FilesystemMiddleware(backend=sandbox)
+        content = middleware._interpret_capture_output(offload, capture_path, "c_capped_msg")
+
+        # The status line and the in-band notice must tell the model the same story.
+        assert "the saved file is incomplete" in content
+        assert "capture stopped at its 5000-byte limit" in content
+        assert "full output at the path above" not in content
+
+    async def test_nonzero_exit_code_preserved(self, tools: tuple, invoke: Callable) -> None:
+        execute_tool, _ = tools
+        result = await invoke(execute_tool, {"command": "echo oops; exit 3", "runtime": self._runtime("c_ec")})
 
         assert "oops" in result.content
         assert "exit code 3" in result.content
+        assert result.artifact == {"exit_code": 3}
 
-    def test_runaway_output_is_capped_and_flagged(self, tools: tuple, sandbox: LocalSubprocessSandbox, monkeypatch: pytest.MonkeyPatch) -> None:
+    async def test_offloaded_result_carries_exit_code_artifact(self, tools: tuple, invoke: Callable) -> None:
+        # When the output is offloaded, `_interpret_capture_output` replaces the
+        # plain `[Command ... exit code N]` formatting with a `read_file` pointer,
+        # so the artifact is the only structured channel for the exit code.
+        execute_tool, _ = tools
+        result = await invoke(execute_tool, {"command": f"{_BIG_OUTPUT_CMD}; exit 3", "runtime": self._runtime("c_off_ec")})
+
+        assert self._capture_path("c_off_ec") in result.content  # actually offloaded
+        assert result.artifact == {"exit_code": 3}
+
+    async def test_runaway_output_is_capped_and_flagged(
+        self,
+        tools: tuple,
+        sandbox: LocalSubprocessSandbox,
+        monkeypatch: pytest.MonkeyPatch,
+        invoke: Callable,
+    ) -> None:
         # Cap must exceed the eviction budget so a capped result still offloads
         # (rather than fitting inline). Default budget is ~80 KB.
         cap = 100_000
@@ -1630,10 +1902,11 @@ class TestExecuteCaptureOffload:
         # the excess instead of SIGPIPE-killing the producer, so the command's real
         # exit code survives -- a regression guard: closing the pipe early would
         # report this successful command as failed.
-        result = execute_tool.invoke({"command": f"{_BIG_OUTPUT_CMD}; exit 0", "runtime": rt})
+        result = await invoke(execute_tool, {"command": f"{_BIG_OUTPUT_CMD}; exit 0", "runtime": rt})
 
         assert "exceeded the capture size limit" in result.content
         assert "succeeded with exit code 0" in result.content
+        assert result.artifact == {"exit_code": 0}
         # The on-disk capture file is bounded at the cap regardless of total output.
         size = sandbox.execute(f"wc -c < {self._capture_path('c_cap')}").output.strip()
         assert size == str(cap)
@@ -1656,3 +1929,42 @@ class TestExecuteCaptureOffload:
         offload = sandbox.execute_with_offload(_BIG_OUTPUT_CMD, on_path, max_inline_bytes=budget)
         assert offload.offloaded is True
         assert "line 2500:" not in offload.response.output  # middle omitted -> it's a preview
+
+
+class TestBinaryContentOffload:
+    """End-to-end binary read offload through `create_deep_agent` on a real shell."""
+
+    @pytest.fixture(autouse=True)
+    def setup_test_dir(self, tmp_path: Path) -> None:
+        self.sandbox = LocalSubprocessSandbox()
+        self.sandbox.set_real_root(str(tmp_path / "sandbox_ops"))
+        self.sandbox.execute("rm -rf /tmp/test_sandbox_ops && mkdir -p /tmp/test_sandbox_ops")
+
+    def test_read_image_snapshots_blob_in_sandbox(self) -> None:
+        raw = b"\x89PNG\r\n\x1a\n fake image data"
+        digest = hashlib.sha256(raw).hexdigest()
+        Path(self.sandbox._to_real_path(f"{VIRTUAL_SANDBOX_ROOT}/photo.png")).write_bytes(raw)
+        backend = CompositeBackend(default=self.sandbox, routes={}, artifacts_root=VIRTUAL_SANDBOX_ROOT)
+        model = GenericFakeChatModel(
+            messages=iter(
+                [
+                    AIMessage(
+                        content="",
+                        tool_calls=[
+                            {"name": "read_file", "args": {"file_path": f"{VIRTUAL_SANDBOX_ROOT}/photo.png"}, "id": "call_img", "type": "tool_call"}
+                        ],
+                    ),
+                    AIMessage(content="Here is the image."),
+                ]
+            )
+        )
+        agent = create_deep_agent(model=model, backend=backend, middleware=[FilesystemMiddleware(backend=backend, offload_binary_content=True)])
+
+        result = agent.invoke({"messages": [HumanMessage(content="Read the image")]})
+
+        tool_message = next(m for m in result["messages"] if m.type == "tool")
+        assert tool_message.content == [{"type": "image", "mime_type": "image/png", "deepagents_blob": digest}]
+        listing = self.sandbox.execute(f"sha256sum {VIRTUAL_SANDBOX_ROOT}/blobs/{digest}")
+        assert listing.output.split()[0] == digest
+        sent = next(m for m in model.call_history[1]["messages"] if m.type == "tool")
+        assert sent.content[0]["base64"] == base64.b64encode(raw).decode("ascii")

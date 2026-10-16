@@ -20,27 +20,30 @@ def test_store_backend_crud_and_search():
     assert isinstance(msg, WriteResult) and msg.error is None and msg.path == "/docs/readme.md"
 
     # read
-    txt = be.read("/docs/readme.md")
-    assert "hello store" in txt
+    read_result = be.read("/docs/readme.md")
+    assert isinstance(read_result, ReadResult) and read_result.file_data is not None
+    assert "hello store" in read_result.file_data["content"]
 
     # edit
     msg2 = be.edit("/docs/readme.md", "hello", "hi", replace_all=False)
     assert isinstance(msg2, EditResult) and msg2.error is None and msg2.occurrences == 1
 
     # ls_info (path prefix filter)
-    infos = be.ls_info("/docs/")
+    infos = be.ls("/docs/").entries
+    assert infos is not None
     assert any(i["path"] == "/docs/readme.md" for i in infos)
 
-    # grep_raw
-    matches = be.grep_raw("hi", path="/")
-    assert isinstance(matches, list) and any(m["path"] == "/docs/readme.md" for m in matches)
+    # grep
+    matches = be.grep("hi", path="/").matches
+    assert matches is not None and any(m["path"] == "/docs/readme.md" for m in matches)
 
-    # glob_info
-    g = be.glob_info("*.md", path="/")
-    assert len(g) == 0
+    # glob: bare `*.md` and `**/*.md` both match nested files (shared contract)
+    g = be.glob("*.md", path="/").matches
+    assert any(i["path"] == "/docs/readme.md" for i in g)
 
-    g2 = be.glob_info("**/*.md", path="/")
+    g2 = be.glob("**/*.md", path="/").matches
     assert any(i["path"] == "/docs/readme.md" for i in g2)
+    assert {i["path"] for i in g} == {i["path"] for i in g2}
 
 
 def test_store_backend_read_surfaces_pagination_metadata():
@@ -56,6 +59,34 @@ def test_store_backend_read_surfaces_pagination_metadata():
     assert result.start_line == 2
     assert result.end_line == 3
     assert result.next_offset == 3
+
+
+@pytest.mark.parametrize(("offset", "limit"), [(0, 0), (0, -3), (-1, 0)])
+def test_store_backend_read_non_positive_limit_returns_empty_read(offset: int, limit: int):
+    """`StoreBackend.read` inherits the shared clamp rather than raising."""
+    mem_store = InMemoryStore()
+    be = StoreBackend(store=mem_store, namespace=lambda _rt: ("filesystem",))
+    be.write("/notes.txt", "one\ntwo\nthree")
+
+    result = be.read("/notes.txt", offset=offset, limit=limit)
+
+    assert result.error is None
+    assert result.file_data is not None
+    assert result.file_data["content"] == ""
+    assert result.start_line is None
+
+
+def test_store_backend_read_negative_offset_starts_at_first_line():
+    """A negative offset is clamped to the start of the file instead of erroring."""
+    mem_store = InMemoryStore()
+    be = StoreBackend(store=mem_store, namespace=lambda _rt: ("filesystem",))
+    be.write("/notes.txt", "one\ntwo\nthree")
+
+    result = be.read("/notes.txt", offset=-1, limit=2)
+
+    assert result.error is None
+    assert result.start_line == 1
+    assert result.end_line == 2
 
 
 def test_store_backend_reads_mkv_as_binary_without_slicing():
@@ -119,6 +150,22 @@ def test_store_backend_reads_legacy_list_content() -> None:
     assert "encoding" not in stored.value
 
 
+def test_store_backend_reports_utf8_byte_sizes() -> None:
+    mem_store = InMemoryStore()
+    be = StoreBackend(store=mem_store, namespace=lambda _rt: ("filesystem",))
+    content = "hello 😀 €"
+    be.write("/unicode.txt", content)
+    expected_size = len(content.encode("utf-8"))
+
+    listing = be.ls("/").entries
+    assert listing is not None
+    assert listing[0]["size"] == expected_size
+
+    matches = be.glob("*.txt", path="/").matches
+    assert matches is not None
+    assert matches[0]["size"] == expected_size
+
+
 def test_store_backend_rejects_legacy_lists_with_non_string_items() -> None:
     mem_store = InMemoryStore()
     be = StoreBackend(store=mem_store, namespace=lambda _rt: ("filesystem",))
@@ -162,6 +209,20 @@ def test_store_backend_edit_migrates_legacy_list_content() -> None:
     assert stored.value["encoding"] == "utf-8"
 
 
+def test_store_backend_edit_empty_old_string_returns_error() -> None:
+    mem_store = InMemoryStore()
+    be = StoreBackend(store=mem_store, namespace=lambda _rt: ("filesystem",))
+    mem_store.put(("filesystem",), "/legacy.txt", {"content": ["hello", "world"]})
+
+    result = be.edit("/legacy.txt", "", "there")
+
+    assert result.error is not None
+    assert "old_string cannot be empty" in result.error
+    stored = mem_store.get(("filesystem",), "/legacy.txt")
+    assert stored is not None
+    assert stored.value["content"] == ["hello", "world"]
+
+
 def test_store_backend_write_overwrites_existing_file():
     mem_store = InMemoryStore()
     be = StoreBackend(store=mem_store, namespace=lambda _ctx: ("filesystem",))
@@ -197,7 +258,8 @@ def test_store_backend_ls_nested_directories():
         res = be.write(path, content)
         assert res.error is None
 
-    root_listing = be.ls_info("/")
+    root_listing = be.ls("/").entries
+    assert root_listing is not None
     root_paths = [fi["path"] for fi in root_listing]
     assert "/config.json" in root_paths
     assert "/src/" in root_paths
@@ -207,20 +269,22 @@ def test_store_backend_ls_nested_directories():
     assert "/docs/readme.md" not in root_paths
     assert "/docs/api/reference.md" not in root_paths
 
-    src_listing = be.ls_info("/src/")
+    src_listing = be.ls("/src/").entries
+    assert src_listing is not None
     src_paths = [fi["path"] for fi in src_listing]
     assert "/src/main.py" in src_paths
     assert "/src/utils/" in src_paths
     assert "/src/utils/helper.py" not in src_paths
 
-    utils_listing = be.ls_info("/src/utils/")
+    utils_listing = be.ls("/src/utils/").entries
+    assert utils_listing is not None
     utils_paths = [fi["path"] for fi in utils_listing]
     assert "/src/utils/helper.py" in utils_paths
     assert "/src/utils/common.py" in utils_paths
     assert len(utils_paths) == 2
 
-    empty_listing = be.ls_info("/nonexistent/")
-    assert empty_listing == []
+    empty_listing = be.ls("/nonexistent/")
+    assert empty_listing.entries == []
 
 
 def test_store_backend_ls_trailing_slash():
@@ -236,11 +300,14 @@ def test_store_backend_ls_trailing_slash():
         res = be.write(path, content)
         assert res.error is None
 
-    listing_from_root = be.ls_info("/")
+    listing_from_root = be.ls("/").entries
+    assert listing_from_root is not None
     assert len(listing_from_root) > 0
 
-    listing1 = be.ls_info("/dir/")
-    listing2 = be.ls_info("/dir")
+    listing1 = be.ls("/dir/").entries
+    listing2 = be.ls("/dir").entries
+    assert listing1 is not None
+    assert listing2 is not None
     assert len(listing1) == len(listing2)
     assert [fi["path"] for fi in listing1] == [fi["path"] for fi in listing2]
 
@@ -280,8 +347,9 @@ def test_store_backend_namespace_user_scoped() -> None:
     assert items[0].key == "/test.txt"
 
     # Read it back
-    content = be.read("/test.txt")
-    assert "hello alice" in content
+    read_result = be.read("/test.txt")
+    assert read_result.file_data is not None
+    assert "hello alice" in read_result.file_data["content"]
 
 
 def test_store_backend_namespace_multi_level() -> None:
@@ -319,11 +387,13 @@ def test_store_backend_namespace_isolation() -> None:
     be_bob.write("/notes.txt", "bob notes")
 
     # Verify isolation
-    alice_content = be_alice.read("/notes.txt")
-    assert "alice notes" in alice_content
+    alice_result = be_alice.read("/notes.txt")
+    assert alice_result.file_data is not None
+    assert "alice notes" in alice_result.file_data["content"]
 
-    bob_content = be_bob.read("/notes.txt")
-    assert "bob notes" in bob_content
+    bob_result = be_bob.read("/notes.txt")
+    assert bob_result.file_data is not None
+    assert "bob notes" in bob_result.file_data["content"]
 
     # Verify they're in different namespaces
     alice_items = mem_store.search(("filesystem", "alice"))
@@ -430,8 +500,8 @@ def test_store_backend_grep_literal_search_special_chars(pattern: str, expected_
         assert res.error is None
 
     # Test literal search with the pattern
-    matches = be.grep_raw(pattern, path="/")
-    assert isinstance(matches, list)
+    matches = be.grep(pattern, path="/").matches
+    assert matches is not None
     assert any(expected_file in m["path"] for m in matches), f"Pattern '{pattern}' not found in {expected_file}"
 
 

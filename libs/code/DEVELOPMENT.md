@@ -89,6 +89,8 @@ Set the same override for [local dev installs](#local-dev-installs) (`dcode-dev`
 
 When onboarding a new tracing project to Engine, capture the nature of that project first: a production/GA app warrants high-priority alerts, while a staging or active-dev project should use looser thresholds (or stay off Engine) so it does not generate false positives.
 
+A server keeps the first workspace's tracing configuration for its lifetime. Workspaces sharing that server must use matching tracing credentials, projects, endpoints, profile selectors, tracing flags, and redaction policy. A conflicting workspace is refused before its settings can affect cached or concurrent runs; start a separate server for that workspace. Restart the server to change its tracing configuration.
+
 ## Debugging
 
 Deep Agents Code runs as two processes: the **Textual TUI** you interact with, and a **`langgraph dev` subprocess** that hosts the agent graph. Each writes its own log, and a single switch turns both on:
@@ -102,14 +104,15 @@ uv run deepagents-code
 | Variable | Effect |
 | --- | --- |
 | `DEEPAGENTS_CODE_DEBUG` | Master switch. Preserves the server subprocess log on exit (printing its path to stderr) and attaches the client `DEBUG` file handler. Truthy: `1`/`true`/`yes`/`on` (case-insensitive). Falsy: `0`/`false`/`no`/`off`/empty/unset. |
-| `DEEPAGENTS_CODE_DEBUG_FILE=<path>` | Overrides the client log path (default `/tmp/deepagents_debug.log`). **Only takes effect when `DEEPAGENTS_CODE_DEBUG` is truthy**; does **not** affect the server subprocess log. |
+| `DEEPAGENTS_CODE_DEBUG_DIRECTORY=<path>` | Overrides the client log directory (default `/tmp/deepagents_debug`). Each thread writes to `<thread-id>.log`. **Only takes effect when `DEEPAGENTS_CODE_DEBUG` is truthy**; does **not** affect the server subprocess log. |
+| `DEEPAGENTS_CODE_DEBUG_FILE=<path>` | Deprecated compatibility override. When `DEEPAGENTS_CODE_DEBUG_DIRECTORY` and `[debug].directory` are unset, per-thread logs use this path's parent directory. Existing `[debug].file` config works the same way. |
 
 Then pick the log you need by symptom:
 
 | Symptom | Log you want | Default location |
 | --- | --- | --- |
 | App crashes on launch (one-line failure banner) | **Server subprocess log** — the real traceback | `$TMPDIR/deepagents_server_log_*.txt` |
-| App starts, then misbehaves (UI, model calls, slash commands) | **Client app log** — `deepagents_code` at `DEBUG` | `/tmp/deepagents_debug.log` |
+| App starts, then misbehaves (UI, model calls, slash commands) | **Client app log** — `deepagents_code` at `DEBUG` | `/tmp/deepagents_debug/<thread-id>.log` |
 
 ### Startup crash -> server subprocess log
 
@@ -133,16 +136,22 @@ The TUI only surfaces a one-line banner; the actual exception lives in the subpr
 For problems that appear after the app is up, tail the client log in another terminal while reproducing:
 
 ```bash
-tail -f /tmp/deepagents_debug.log
+tail -f /tmp/deepagents_debug/<thread-id>.log
 ```
 
-To send it elsewhere, also `export DEEPAGENTS_CODE_DEBUG_FILE=<path>`. The handler appends across runs, so a single file accumulates every session.
+To send logs elsewhere, also `export DEEPAGENTS_CODE_DEBUG_DIRECTORY=<path>`. Each thread gets its own append-only file, and changing threads in the app switches the active log file.
+
+The directory is created or tightened to owner-only access, and each file is created or tightened to user-only access. Symlinks are refused. If either cannot be secured, no file handler is attached and a warning goes to stderr. Use the in-app Debug Console in that case.
+
+Raw stdio MCP server stderr is discarded to protect the TUI and prevent unbounded disk growth, including in debug mode. Structured MCP log notifications still reach the application logger with the server name and severity.
 
 ### In-app Debug Console (`Ctrl+\`)
 
 Press `Ctrl+\` (or run the hidden `/debug` command) inside a session to toggle a read-only Debug Console overlay. It shows a point-in-time session/runtime snapshot (version, model, thread, cwd, auto-approve, sandbox, MCP servers, token usage, debug-log path) plus a live tail of recent `deepagents_code.*` log records.
 
-The tail is fed by an always-on in-memory ring buffer (`_debug_buffer.install_log_buffer`, installed on the package logger in `__init__.py`), so it works **without** `DEEPAGENTS_CODE_DEBUG` — though enabling that switch raises the captured level to `DEBUG` and adds the file handler above. In the console, `Ctrl+L` clears the on-screen view (the buffer keeps accruing) and `c` copies the visible lines.
+The tail is fed by an always-on in-memory ring buffer (`_debug_buffer.install_log_buffer`, installed on the package logger in `__init__.py`), so it works **without** `DEEPAGENTS_CODE_DEBUG` — though enabling that switch raises the captured level to `DEBUG` and adds the file handler above. In the console, `Ctrl+X` clears the on-screen view (the buffer keeps accruing) and `c` copies the visible lines. `Ctrl+L` remains an alias for clearing the view.
+
+In `/btw`, `Esc` hides the modal and cancels any unfinished answer. Completed side exchanges remain available when you reopen `/btw` or switch away from the main thread and return. Each main thread has its own side history, kept only while the app runs and separate from the main conversation. `Ctrl+X` cancels the side answer and clears that thread's side transcript, follow-up context, and draft while keeping the modal open.
 
 ## Local dev installs
 
@@ -168,7 +177,7 @@ uv pip install --python ~/.local/share/dcode-dev/bin/python -e <repo>/libs/code
 ln -sf ~/.local/share/dcode-dev/bin/dcode ~/.local/bin/dcode-dev
 ```
 
-The `--python 3.13` is illustrative — any interpreter satisfying the package's `requires-python` (currently `>=3.11`) works; omit the flag to let `uv` pick.
+The `--python 3.13` is illustrative — any interpreter satisfying the package's `requires-python` (currently `>=3.12`) works; omit the flag to let `uv` pick.
 
 > **Why `uv venv` + `uv pip install -e` rather than `uv sync` or `uv tool install --editable`?** This builds an isolated venv *outside* the workspace's locked environment, so the dev binary can be re-resolved on demand without disturbing the released tool or the repo's `uv.lock`. (`uv pip` and `uv venv` are first-class `uv` subcommands here, not bare `pip`.)
 
